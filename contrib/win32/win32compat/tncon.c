@@ -574,7 +574,18 @@ ReadConsoleForTermEmul(HANDLE hInput, char *destin, int destinlen)
 							NetWriteString2(pParams->Socket, (char *)SHIFT_CTRL_PF12_KEY, strlen(SHIFT_CTRL_PF12_KEY), 0);
 						break;
 					default:
-						NetWriteString2(pParams->Socket, (char *)octets, n, 0);
+						if (strcmp((char *) octets, "")) {
+							if ((dwControlKeyState & LEFT_ALT_PRESSED) || (dwControlKeyState & RIGHT_ALT_PRESSED)) {
+								char *p = malloc(n + 2);
+								p[0] = '\x1b';
+								memcpy(p + 1, (char *)octets, n);
+								p[n + 1] = '\0';
+								NetWriteString2(pParams->Socket, p, n + 1, 0);
+								free(p);
+							}
+							else
+								NetWriteString2(pParams->Socket, (char *)octets, n, 0);
+						}							
 						break;
 					}
 				}
