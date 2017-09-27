@@ -34,6 +34,8 @@
 #include <Shlwapi.h>
 #include <conio.h>
 #include <LM.h>
+#include <Sddl.h>
+#include <Aclapi.h>
 
 #include "inc\unistd.h"
 #include "inc\sys\stat.h"
@@ -604,9 +606,10 @@ file_attr_to_st_mode(wchar_t * path, DWORD attributes)
 	if (!(attributes & FILE_ATTRIBUTE_READONLY))
 		mode |= S_IWRITE;
 
-	// propagate owner read/write/execute bits to group/other fields.
-	mode |= (mode & 0700) >> 3;
-	mode |= (mode & 0700) >> 6;
+	// We don't populate the group permissions as its not applicable to windows OS.
+	// propagate owner read/write/execute bits to other fields.	
+	mode |= get_others_file_permissions(path);
+
 	return mode;
 }
 
@@ -1303,4 +1306,69 @@ to_lower_case(char *s)
 {
 	for (; *s; s++)
 		*s = tolower((u_char)*s);
+}
+
+int
+get_others_file_permissions(wchar_t * file_name)
+{
+	PSECURITY_DESCRIPTOR pSD = NULL;
+	PSID owner_sid = NULL, current_trustee_sid = NULL;
+	PACL dacl = NULL;
+	DWORD error_code = ERROR_SUCCESS;
+	BOOL is_valid_sid = FALSE, is_valid_acl = FALSE;
+	int ret = 0, mode_world = 0, mode_authenticated_users = 0;
+	wchar_t *w_sid = NULL;
+
+	/*Get the owner sid of the file.*/
+	if ((error_code = GetNamedSecurityInfoW(file_name, SE_FILE_OBJECT,
+		OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+		&owner_sid, NULL, &dacl, NULL, &pSD)) != ERROR_SUCCESS) {
+		debug3("failed to retrieve the owner sid and dacl of file: %ls with error code: %d", file_name, error_code);
+		goto cleanup;
+	}
+
+	if (((is_valid_sid = IsValidSid(owner_sid)) == FALSE) || ((is_valid_acl = IsValidAcl(dacl)) == FALSE)) {
+		debug3("IsValidSid: %d; is_valid_acl: %d", is_valid_sid, is_valid_acl);
+		goto cleanup;
+	}
+
+	for (DWORD i = 0; i < dacl->AceCount; i++) {
+		PVOID current_ace = NULL;
+		PACE_HEADER current_aceHeader = NULL;
+		ACCESS_MASK current_access_mask = 0;
+		int mode_tmp = 0;
+		if (!GetAce(dacl, i, &current_ace)) {
+			debug3("GetAce() failed");
+			goto cleanup;
+		}
+
+		current_aceHeader = (PACE_HEADER)current_ace;
+		/* only interested in Allow ACE */
+		if (current_aceHeader->AceType != ACCESS_ALLOWED_ACE_TYPE)
+			continue;
+
+		PACCESS_ALLOWED_ACE pAllowedAce = (PACCESS_ALLOWED_ACE)current_ace;
+		current_trustee_sid = &(pAllowedAce->SidStart);
+		current_access_mask = pAllowedAce->Mask;
+
+		if ((current_access_mask & READ_PERMISSIONS) == READ_PERMISSIONS)
+			mode_tmp |= S_IROTH;
+
+		if ((current_access_mask & WRITE_PERMISSIONS) == WRITE_PERMISSIONS)
+			mode_tmp |= S_IWOTH;
+
+		if ((current_access_mask & EXECUTE_PERMISSIONS) == EXECUTE_PERMISSIONS)
+			mode_tmp |= S_IXOTH;
+
+		if (IsWellKnownSid(current_trustee_sid, WinWorldSid))
+			mode_world |= mode_tmp;
+		else if (IsWellKnownSid(current_trustee_sid, WinAuthenticatedUserSid))
+			mode_authenticated_users |= mode_tmp;
+	}
+
+	ret = mode_world ? mode_world : mode_authenticated_users;
+cleanup:
+	if (pSD)
+		LocalFree(pSD);
+	return ret;
 }
