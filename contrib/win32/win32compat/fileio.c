@@ -271,15 +271,6 @@ st_mode_to_file_att(int mode, wchar_t * attributes)
 	case S_IRWXO:
 		swprintf_s(attributes, MAX_ATTRIBUTE_LENGTH, L"FA");
 		break;
-	case S_IXOTH:
-		swprintf_s(attributes, MAX_ATTRIBUTE_LENGTH, L"FX");
-		break;
-	case S_IWOTH:
-		swprintf_s(attributes, MAX_ATTRIBUTE_LENGTH, L"FW");
-		break;
-	case S_IROTH:
-		swprintf_s(attributes, MAX_ATTRIBUTE_LENGTH, L"FR");
-		break;
 	default:
 		if((mode & S_IROTH) != 0)
 			att |= (FILE_GENERIC_READ | FILE_EXECUTE);
