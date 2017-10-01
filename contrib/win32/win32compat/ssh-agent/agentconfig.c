@@ -154,10 +154,10 @@ config_log_level() {
 }
 
 int
-pubkey_allowed(struct sshkey* pubkey, HANDLE user_token) {
+pubkey_allowed(struct sshkey* pubkey, char*  user_utf8) {
 	struct passwd *pw;
 
-	if ((pw = w32_getpwtoken(user_token)) == NULL)
+	if ((pw = w32_getpwnam(user_utf8)) == NULL)
 		return 0;
 
 	return user_key_allowed(pw, pubkey, 1);
