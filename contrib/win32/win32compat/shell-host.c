@@ -1375,10 +1375,10 @@ start_withno_pty(wchar_t *command)
 	PROCESS_INFORMATION pi;
 	wchar_t *cmd = (wchar_t *)malloc(sizeof(wchar_t) * MAX_CMD_LEN);
 	SECURITY_ATTRIBUTES sa;
-	BOOL ret, process_input = FALSE, run_under_cmd = FALSE;
+	BOOL ret, run_under_cmd = FALSE;
 	size_t command_len;
 	char *buf = (char *)malloc(BUFF_SIZE + 1);
-	DWORD rd = 0, wr = 0, i = 0;
+	DWORD rd = 0, wr = 0;
 
 	if (cmd == NULL) {
 		printf_s("ssh-shellhost is out of memory");
@@ -1413,29 +1413,11 @@ start_withno_pty(wchar_t *command)
 	GOTO_CLEANUP_ON_FALSE(SetHandleInformation(child_pipe_write, HANDLE_FLAG_INHERIT, 0));
 
 	/*
-	* check if the input needs to be processed (ex for CRLF translation)
-	* input stream needs to be processed when running the command
-	* within shell processor. This is needed when
-	*  - launching a interactive shell (-nopty)
-	*    ssh -T user@target
-	*  - launching cmd explicity
-	*    ssh user@target cmd
-	*  - executing a cmd command
-	*    ssh user@target dir
-	*  - executing a cmd command within a cmd
-	*    ssh user@target cmd /c dir
-	*/
-
-	if (!command)
-		process_input = TRUE;
-	else {
-		command_len = wcsnlen_s(command, MAX_CMD_LEN);
-		if ((command_len >= 3 && _wcsnicmp(command, L"cmd", 4) == 0) ||
-		    (command_len >= 7 && _wcsnicmp(command, L"cmd.exe", 8) == 0) ||
-		    (command_len >= 4 && _wcsnicmp(command, L"cmd ", 4) == 0) ||
-		    (command_len >= 8 && _wcsnicmp(command, L"cmd.exe ", 8) == 0))
-			process_input = TRUE;
-	}
+	 * Because the client requested no pseudoterminals, we don't cook the
+	 * IO. If the client wants cooked IO, the client should request a
+	 * pseudoterminal. Otherwise, we don't mess with the IO, as is expected
+	 * in non-pty mode.
+	 */
 
 	/* Try launching command as is first */
 	if (command) {
@@ -1462,7 +1444,6 @@ start_withno_pty(wchar_t *command)
 	
 		GOTO_CLEANUP_ON_FALSE(CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi));
 		/* Create process succeeded when running under cmd. input stream needs to be processed */
-		process_input = TRUE;
 	}
 	
 	/* close unwanted handles*/
@@ -1483,71 +1464,13 @@ start_withno_pty(wchar_t *command)
 	}
 	/* process data from pipe_in and route appropriately */
 	while (1) {
-		rd = wr = i = 0;
+		rd = wr = 0;
 		buf[0] = L'\0';
 		GOTO_CLEANUP_ON_FALSE(ReadFile(pipe_in, buf, BUFF_SIZE, &rd, NULL));
 
-		if (process_input == FALSE) {
-			/* write stream directly to child stdin */
-			GOTO_CLEANUP_ON_FALSE(WriteFile(child_pipe_write, buf, rd, &wr, NULL));
-			continue;
-		}
+		/* write stream directly to child stdin */
+		GOTO_CLEANUP_ON_FALSE(WriteFile(child_pipe_write, buf, rd, &wr, NULL));
 		/* else - process input before routing it to child */
-		while (i < rd) {
-			/* skip arrow keys */
-			if ((rd - i >= 3) && (buf[i] == '\033') && (buf[i + 1] == '[') &&
-			    (buf[i + 2] >= 'A') && (buf[i + 2] <= 'D')) {
-				i += 3;
-				continue;
-			}
-
-			/* skip tab */
-			if (buf[i] == '\t') {
-				i++;
-				continue;
-			}
-
-			/* Ctrl +C */
-			if (buf[i] == '\003') {
-				GOTO_CLEANUP_ON_FALSE(GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0));
-				in_cmd_len = 0;
-				i++;
-				continue;
-			}
-
-			/* for backspace, we need to send space and another backspace for visual erase */
-			if (buf[i] == '\b') {
-				if (in_cmd_len > 0) {
-					GOTO_CLEANUP_ON_FALSE(WriteFile(pipe_out, "\b \b", 3, &wr, NULL));
-					in_cmd_len--;
-				}
-				i++;
-				continue;
-			}
-
-			/* For CR and LF */
-			if ((buf[i] == '\r') || (buf[i] == '\n')) {
-				/* TODO - do a much accurate mapping */				
-				if ((buf[i] == '\r') && ((i == rd - 1) || (buf[i + 1] != '\n')))
-					buf[i] = '\n';
-				GOTO_CLEANUP_ON_FALSE(WriteFile(pipe_out, buf + i, 1, &wr, NULL));
-				in_cmd[in_cmd_len] = buf[i];
-				in_cmd_len++;
-				GOTO_CLEANUP_ON_FALSE(WriteFile(child_pipe_write, in_cmd, in_cmd_len, &wr, NULL));
-				in_cmd_len = 0;
-				i++;
-				continue;
-			}
-
-			GOTO_CLEANUP_ON_FALSE(WriteFile(pipe_out, buf + i, 1, &wr, NULL));
-			in_cmd[in_cmd_len] = buf[i];
-			in_cmd_len++;
-			if (in_cmd_len == MAX_CMD_LEN - 1) {
-				GOTO_CLEANUP_ON_FALSE(WriteFile(child_pipe_write, in_cmd, in_cmd_len, &wr, NULL));
-				in_cmd_len = 0;
-			}
-			i++;
-		}
 	}
 cleanup:
 
