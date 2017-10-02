@@ -131,6 +131,22 @@ Describe "E2E scenarios for ssh client" -Tags "CI" {
             0 | ssh -p $port $ssouser@$server pause
             $true | Should Be $true
         }#>
+
+        It "$tC.$tI - should not mangle stdout when pty allocation is disabled" {
+            $o = echo "`$pwd.Path; exit" | ssh -T test_target cd C:\ `&`& powershell -Command -
+            $o.Trim() | Should Be "C:\"
+        }
+
+        It "$tC.$tI - should not mangle stdin when pty allocation is disabled" {
+            $nchars = "`b`t$([char]0x1b)[$([char]0x03)"
+            # As of this writing: the Windows ssh client doesn't seem to respect stdin being closed
+            # And PowerShell's exit cmdlet doesn't. So we Stop-Process on ourselves so we _know_ we're gone
+            # We should test the ^r^n case too, but that requires another $input.MoveNext(). The ssh client
+            # currently seems to be getting stuck with stdin redirect so we can't just assume that $input | Foreach-Object
+            # works.
+            $o = echo $nchars | ssh -T test_target cd C:\ `&`& powershell -Command `"`$input.MoveNext`(`) ^`| Out-Null`; Write `$input.Current`; Stop-Process `-Id `$PID`"
+            $o.Trim() | Should Be $nchars
+        }
     }
 
     Context "$tC - cmdline parameters" {
