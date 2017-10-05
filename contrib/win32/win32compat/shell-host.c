@@ -1356,9 +1356,6 @@ cleanup:
 	return child_exit_code;
 }
 
-HANDLE child_pipe_read;
-HANDLE child_pipe_write;
-
 DWORD WINAPI 
 MonitorChild_nopty( _In_ LPVOID lpParameter)
 {
@@ -1377,8 +1374,6 @@ start_withno_pty(wchar_t *command)
 	SECURITY_ATTRIBUTES sa;
 	BOOL ret, run_under_cmd = FALSE;
 	size_t command_len;
-	char *buf = (char *)malloc(BUFF_SIZE + 1);
-	DWORD rd = 0, wr = 0;
 
 	if (cmd == NULL) {
 		printf_s("ssh-shellhost is out of memory");
@@ -1394,23 +1389,13 @@ start_withno_pty(wchar_t *command)
 
 	memset(&sa, 0, sizeof(SECURITY_ATTRIBUTES));
 	sa.bInheritHandle = TRUE;
-	/* use the default buffer size, 64K*/
-	if (!CreatePipe(&child_pipe_read, &child_pipe_write, &sa, 0)) {
-		printf_s("ssh-shellhost-can't open no pty session, error: %d", GetLastError());
-		return -1;
-	}
-
 	memset(&si, 0, sizeof(STARTUPINFO));
 	memset(&pi, 0, sizeof(PROCESS_INFORMATION));
 	si.cb = sizeof(STARTUPINFO);
 	si.dwFlags = STARTF_USESTDHANDLES;
-	si.hStdInput = child_pipe_read;
+	si.hStdInput = pipe_in;
 	si.hStdOutput = pipe_out;
 	si.hStdError = pipe_err;
-
-	/* disable inheritance on child_pipe_write and pipe_in*/
-	GOTO_CLEANUP_ON_FALSE(SetHandleInformation(pipe_in, HANDLE_FLAG_INHERIT, 0));
-	GOTO_CLEANUP_ON_FALSE(SetHandleInformation(child_pipe_write, HANDLE_FLAG_INHERIT, 0));
 
 	/*
 	 * Because the client requested no pseudoterminals, we don't cook the
@@ -1429,9 +1414,9 @@ start_withno_pty(wchar_t *command)
 			else
 				goto cleanup;
 		}
-	}
-	else
+	} else {
 		run_under_cmd = TRUE;
+	}
 
 	/* if above failed with FILE_NOT_FOUND, try running the provided command under cmd*/
 	if (run_under_cmd) {
@@ -1443,54 +1428,26 @@ start_withno_pty(wchar_t *command)
 		}
 	
 		GOTO_CLEANUP_ON_FALSE(CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi));
-		/* Create process succeeded when running under cmd. input stream needs to be processed */
-	}
-	
-	/* close unwanted handles*/
-	CloseHandle(child_pipe_read);
-	child_pipe_read = INVALID_HANDLE_VALUE;
+		/* Create process succeeded when running under cmd. */
+	}	
 	child = pi.hProcess;
-	/* monitor child exist */
-	monitor_thread = CreateThread(NULL, 0, MonitorChild_nopty, NULL, 0, NULL);
-	if (IS_INVALID_HANDLE(monitor_thread))
-		goto cleanup;
 
 	/* disable Ctrl+C hander in this process*/
 	SetConsoleCtrlHandler(NULL, TRUE);
 
-	if (buf == NULL) {
-		printf_s("ssh-shellhost is out of memory");
-		exit(255);
-	}
-	/* process data from pipe_in and route appropriately */
-	while (1) {
-		rd = wr = 0;
-		buf[0] = L'\0';
-		GOTO_CLEANUP_ON_FALSE(ReadFile(pipe_in, buf, BUFF_SIZE, &rd, NULL));
-
-		/* write stream directly to child stdin */
-		GOTO_CLEANUP_ON_FALSE(WriteFile(child_pipe_write, buf, rd, &wr, NULL));
-		/* else - process input before routing it to child */
-	}
+	/* Now that we've passed everything through, wait for the child to exit */
+	WaitForSingleObject(child, INFINITE);
+	GetExitCodeProcess(child, &child_exit_code);
 cleanup:
-
-	/* close child's stdin first */
-	if(!IS_INVALID_HANDLE(child_pipe_write))
-		CloseHandle(child_pipe_write);
-	
-	if (!IS_INVALID_HANDLE(monitor_thread)) {
-		WaitForSingleObject(monitor_thread, INFINITE);
-		CloseHandle(monitor_thread);
-	}		
-	if (!IS_INVALID_HANDLE(child))
+	if (!IS_INVALID_HANDLE(pipe_in)) {
+		CloseHandle(pipe_in);
+	}
+	if (!IS_INVALID_HANDLE(child)) {
 		TerminateProcess(child, 0);
-
-	if (buf != NULL)
-		free(buf);
-
-	if (cmd != NULL)
+	}
+	if (cmd != NULL) {
 		free(cmd);
-	
+	}
 	return child_exit_code;
 }
 
