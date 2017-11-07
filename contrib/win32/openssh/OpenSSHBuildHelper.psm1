@@ -522,6 +522,18 @@ function Start-OpenSSHBuild
         Write-BuildMsg -AsError -ErrorAction Stop -Message "Build failed for OpenSSH.`nExitCode: $error."
     }    
 
+    # Need to copy LibreSSL libcrypto.dll to the build root or nothing works
+    $buildRoot  = Join-Path $script:OpenSSHRoot bin
+    $buildRoot  = Join-Path $buildRoot $NativeHostArch
+    $buildRoot  = Join-Path $buildRoot $Configuration
+    $cryptoPath = Join-Path $script:OpenSSHRoot contrib
+    $cryptoPath = Join-Path $cryptoPath win32
+    $cryptoPath = Join-Path $cryptoPath openssh
+    $cryptoPath = Join-Path $cryptoPath LibreSSLSDK
+    $cryptoPath = Join-Path $cryptoPath $NativeHostArch
+    $dllSrc     = Join-Path $cryptoPath libcrypto.dll
+    Copy-Item $dllSrc $buildRoot
+
     Write-BuildMsg -AsInfo -Message "SSH build successful."
 }
 
