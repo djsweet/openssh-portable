@@ -49,12 +49,16 @@ Describe "E2E scenarios for ssh key management" -Tags "CI" {
             $myACL.Access | Should Not Be $null
             
             $ReadAccessPerm = ([System.UInt32] [System.Security.AccessControl.FileSystemRights]::Read.value__) -bor `
-                    ([System.UInt32] [System.Security.AccessControl.FileSystemRights]::ReadAndExecute.value__)  -bor `
+            # keygen no longer sets execution rights
+            #       ([System.UInt32] [System.Security.AccessControl.FileSystemRights]::ReadAndExecute.value__)  -bor `
                     ([System.UInt32] [System.Security.AccessControl.FileSystemRights]::Synchronize.value__)
             $ReadWriteAccessPerm = ([System.UInt32] [System.Security.AccessControl.FileSystemRights]::Read.value__) -bor `
-                    ([System.UInt32] [System.Security.AccessControl.FileSystemRights]::ReadAndExecute.value__)  -bor `
+            #       ([System.UInt32] [System.Security.AccessControl.FileSystemRights]::ReadAndExecute.value__)  -bor `
                     ([System.UInt32] [System.Security.AccessControl.FileSystemRights]::Write.value__)  -bor `
                     ([System.UInt32] [System.Security.AccessControl.FileSystemRights]::Modify.value__)  -bor `
+                    ([System.UInt32] [System.Security.AccessControl.FileSystemRights]::Synchronize.value__)
+            $ReadWriteAccessNotHostPerm = ([System.UInt32] [System.Security.AccessControl.FileSystemRights]::Read.value__) -bor `
+                    ([System.UInt32] [System.Security.AccessControl.FileSystemRights]::Write.value__) -bor `
                     ([System.UInt32] [System.Security.AccessControl.FileSystemRights]::Synchronize.value__)
 
             $FullControlPerm = [System.UInt32] [System.Security.AccessControl.FileSystemRights]::FullControl.value__
@@ -88,7 +92,14 @@ Describe "E2E scenarios for ssh key management" -Tags "CI" {
 
                     $currentUserSid
                     {
-                        ([System.UInt32]$a.FileSystemRights.value__) | Should Be $ReadWriteAccessPerm
+                        if ($IsHostKey)
+                        {
+                            ([System.UInt32]$a.FileSystemRights.value__) | Should Be $ReadWriteAccessPerm
+                        }
+                        else
+                        {
+                            ([System.UInt32]$a.FileSystemRights.value__) | Should Be $ReadWriteAccessNotHostPerm
+                        }
                         break;
                     }
                     $everyoneSid
@@ -146,7 +157,7 @@ Describe "E2E scenarios for ssh key management" -Tags "CI" {
                 else
                 {
                     ssh-keygen -t $type -P $keypassphrase -f $keyPath
-                }                
+                }
                 ValidateKeyFile -FilePath $keyPath
                 ValidateKeyFile -FilePath "$keyPath.pub" -IsHostKey $false
             }
