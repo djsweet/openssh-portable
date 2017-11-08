@@ -40,6 +40,7 @@
 #include <Sddl.h>
 #include "misc_internal.h"
 #include "inc\utf.h"
+#include "TlHelp32.h"
 
 #define MAX_CONSOLE_COLUMNS 9999
 #define MAX_CONSOLE_ROWS 9999
@@ -271,6 +272,7 @@ BOOL bStartup = TRUE;
 BOOL bHookEvents = FALSE;
 BOOL bFullScreen = FALSE;
 BOOL bUseAnsiEmulation = TRUE;
+BOOL bChildIsCmd = FALSE;
 
 HANDLE child_out = INVALID_HANDLE_VALUE;
 HANDLE child_in = INVALID_HANDLE_VALUE;
@@ -1194,6 +1196,112 @@ cleanup:
 	return 0;
 }
 
+DWORD CmpFileTimes(LPFILETIME left, LPFILETIME right)
+{
+    if (left->dwHighDateTime < right->dwHighDateTime)
+    {
+        return 1;
+    }
+    else if (left->dwHighDateTime > right->dwHighDateTime)
+    {
+        return -1;
+    }
+    else if (left->dwLowDateTime < right->dwLowDateTime)
+    {
+        return 1;
+    }
+    else if (left->dwLowDateTime > right->dwLowDateTime)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Under Windows 10, cmd.exe does _not_ terminate its children
+ * if it is not running in a console session. So what we do
+ * here is terminate all the direct children of the ssh-shellhost
+ * child, only calling this function when the ssh-shellhost child
+ * is cmd.exe.
+ */
+void EnsureKillChildren()
+{
+    PROCESSENTRY32 curProc = { 0 };
+    FILETIME       childCreationTime = { 0 };
+    FILETIME       childTerminationTime = { 0 };
+    FILETIME       kernelTime = { 0 }, userTime = { 0 };
+    HANDLE         hSnapshot = CreateToolhelp32Snapshot(
+        TH32CS_SNAPPROCESS, 0
+    );
+    if (hSnapshot == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+    if (!GetProcessTimes(
+        child, 
+        &childCreationTime, 
+        &childTerminationTime,
+        &kernelTime,
+        &userTime
+    ))
+    {
+        goto cleanup;
+    }
+    if (!Process32First(hSnapshot, &curProc))
+    {
+        goto cleanup;
+    }
+    do
+    {
+        FILETIME procCreationTime = { 0 };
+        FILETIME procTerminationTime = { 0 };
+        if (curProc.th32ParentProcessID != childProcessId)
+        {
+            continue;
+        }
+        HANDLE hSubChild = OpenProcess(
+            PROCESS_ALL_ACCESS,
+            FALSE,
+            curProc.th32ProcessID
+        );
+        DWORD subChildExitCode = 0;
+        if (hSubChild != NULL && hSubChild != child)
+        {
+            if (!GetProcessTimes(
+                hSubChild,
+                &procCreationTime,
+                &procTerminationTime,
+                &kernelTime,
+                &userTime
+            ))
+            {
+                goto subCleanup;
+            }
+            if (!GetExitCodeProcess(hSubChild, &subChildExitCode))
+            {
+                goto subCleanup;
+            }
+            if (subChildExitCode == STILL_ACTIVE)
+            {
+                if (CmpFileTimes(&childCreationTime, &procCreationTime) < 0)
+                {
+                    goto subCleanup;
+                }
+                if (CmpFileTimes(&procCreationTime, &childTerminationTime) < 0)
+                {
+                    goto subCleanup;
+                }
+                TerminateProcess(hSubChild, 0);
+                WaitForSingleObject(hSubChild, INFINITE);
+            }
+subCleanup:
+            CloseHandle(hSubChild);
+        }
+    } while (Process32Next(hSnapshot, &curProc));
+cleanup:
+    CloseHandle(hSnapshot);
+}
+
 wchar_t *
 get_default_shell_path()
 {
@@ -1261,6 +1369,11 @@ get_default_shell_path()
 	return default_shell_path;
 }
 
+BOOL ProcessEntryIsCmd(LPPROCESSENTRY32 pEnt)
+{
+    return wcscmp(pEnt->szExeFile, L"C:\\Windows\\System32\\cmd.exe") == 0;
+}
+
 int 
 start_with_pty(wchar_t *command)
 {
@@ -1270,8 +1383,9 @@ start_with_pty(wchar_t *command)
 	SECURITY_ATTRIBUTES sa;
 	BOOL ret;
 	DWORD dwStatus;
-	HANDLE hEventHook = NULL;
+	HANDLE hEventHook = NULL, hChildSnap = INVALID_HANDLE_VALUE;
 	HMODULE hm_kernel32 = NULL, hm_user32 = NULL;
+    PROCESSENTRY32 pe = { 0 };
 	wchar_t kernel32_dll_path[PATH_MAX]={0,}, user32_dll_path[PATH_MAX]={0,};
 
 	if (cmd == NULL) {
@@ -1366,6 +1480,14 @@ start_with_pty(wchar_t *command)
 			break;
 		Sleep(100);
 	}
+    hChildSnap = CreateToolhelp32Snapshot(0, childProcessId);
+    if (hChildSnap != INVALID_HANDLE_VALUE)
+    {
+        if (Process32First(hChildSnap, &pe)) {
+            bChildIsCmd = ProcessEntryIsCmd(&pe);
+        }
+        CloseHandle(hChildSnap);
+    }
 
 	/* monitor child exist */
 	child = pi.hProcess;
@@ -1396,6 +1518,11 @@ cleanup:
 		WaitForSingleObject(monitor_thread, INFINITE);
 		CloseHandle(monitor_thread);
 	}
+    if (child != INVALID_HANDLE_VALUE && bChildIsCmd)
+    {
+        /* We have to do this after the monitor thread is done */
+        EnsureKillChildren();
+    }
 	if (!IS_INVALID_HANDLE(ux_thread)) {
 		TerminateThread(ux_thread, S_OK);
 		CloseHandle(ux_thread);
@@ -1422,15 +1549,6 @@ cleanup:
 		free(cmd);
 
 	return child_exit_code;
-}
-
-DWORD WINAPI 
-MonitorChild_nopty( _In_ LPVOID lpParameter)
-{
-	WaitForSingleObject(child, INFINITE);
-	GetExitCodeProcess(child, &child_exit_code);
-	CloseHandle(pipe_in);
-	return 0;
 }
 
 int 
@@ -1487,7 +1605,8 @@ start_withno_pty(wchar_t *command)
 	}
 
 	/* if above failed with FILE_NOT_FOUND, try running the provided command under cmd*/
-	if (run_under_cmd) {
+	if (run_under_cmd) 
+    {
 		cmd[0] = L'\0';
 		GOTO_CLEANUP_ON_ERR(wcscat_s(cmd, MAX_CMD_LEN, get_default_shell_path()));
 		if (command) {
@@ -1499,8 +1618,23 @@ start_withno_pty(wchar_t *command)
 	
 		GOTO_CLEANUP_ON_FALSE(CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi));
 		/* Create process succeeded when running under cmd. */
-	}	
+        bChildIsCmd = TRUE;
+	}
+    else
+    {
+        HANDLE hChildSnap = CreateToolhelp32Snapshot(0, pi.dwProcessId);
+        if (hChildSnap != INVALID_HANDLE_VALUE)
+        {
+            PROCESSENTRY32 pe = { 0 };
+            if (Process32First(hChildSnap, &pe))
+            {
+                bChildIsCmd = ProcessEntryIsCmd(&pe);
+            }
+            CloseHandle(hChildSnap);
+        }
+    }
 	child = pi.hProcess;
+    childProcessId = pi.dwProcessId;
 
 	/* disable Ctrl+C hander in this process*/
 	SetConsoleCtrlHandler(NULL, TRUE);
@@ -1514,6 +1648,10 @@ cleanup:
 	}
 	if (!IS_INVALID_HANDLE(child)) {
 		TerminateProcess(child, 0);
+        if (bChildIsCmd)
+        {
+            EnsureKillChildren();
+        }
 	}
 	if (cmd != NULL) {
 		free(cmd);
