@@ -80,8 +80,15 @@ fd_table_initialize()
 	char *envValue = NULL;
 	_dupenv_s(&envValue, NULL, SSH_ASYNC_STDIN);
 	if (NULL != envValue) {
-		if(strcmp(envValue, "1") == 0)
-			w32_io_stdin.type = NONSOCK_FD;
+		if(strcmp(envValue, "1") == 0) {
+            /*
+             * Parent asked for async stdin.
+             * If we can't get it, we keep going as sync.
+             */
+            if (fileio_set_read_event(&w32_io_stdin)) {
+			    w32_io_stdin.type = NONSOCK_FD;
+            }
+        }
 		
 		free(envValue);
 	}
@@ -95,8 +102,15 @@ fd_table_initialize()
 	envValue = NULL;
 	_dupenv_s(&envValue, NULL, SSH_ASYNC_STDOUT);
 	if (NULL != envValue) {
-		if(strcmp(envValue, "1") == 0)
-			w32_io_stdout.type = NONSOCK_FD;
+		if(strcmp(envValue, "1") == 0) {
+            /*
+             * Parent asked for async stdout.
+             * If we can't get it, we keep going as sync.
+             */
+            if (fileio_set_write_event(&w32_io_stdout)) {
+			    w32_io_stdout.type = NONSOCK_FD;
+            }
+        }
 
 		free(envValue);
 	}
@@ -110,8 +124,15 @@ fd_table_initialize()
 	envValue = NULL;
 	_dupenv_s(&envValue, NULL, SSH_ASYNC_STDERR);
 	if (NULL != envValue) {
-		if(strcmp(envValue, "1") == 0)
-			w32_io_stderr.type = NONSOCK_FD;
+		if(strcmp(envValue, "1") == 0) {
+            /*
+             * Parent asked for async stderr.
+             * If we can't get it, we keep going as sync.
+             */
+            if (fileio_set_write_event(&w32_io_stderr)) {
+			    w32_io_stderr.type = NONSOCK_FD;
+            }
+        }
 
 		free(envValue);
 	}
@@ -799,11 +820,25 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 	return out_ready_fds;
 }
 
+BOOL
+fileio_DuplicateHandle(HANDLE hSrc, PHANDLE phDst)
+{
+    return DuplicateHandle(
+        GetCurrentProcess(),
+        hSrc,
+        GetCurrentProcess(),
+        phDst,
+        0,
+        TRUE,
+        DUPLICATE_SAME_ACCESS
+    );
+}
+
 int
 w32_dup(int oldfd)
 {
 	int min_index;
-	struct w32_io* pio;
+	struct w32_io *pio, *poio;
 	HANDLE src, target;
 	CHECK_FD(oldfd);
 	if (oldfd > STDERR_FILENO) {
@@ -815,14 +850,16 @@ w32_dup(int oldfd)
 	if ((min_index = fd_table_get_min_index()) == -1)
 		return -1;
 
-	src = GetStdHandle(fd_table.w32_ios[oldfd]->std_handle);
+    poio = fd_table.w32_ios[oldfd];
+
+	src = GetStdHandle(poio->std_handle);
 	if (src == INVALID_HANDLE_VALUE) {
 		errno = EINVAL;
 		debug3("dup - ERROR: unable to get underlying handle for std fd:%d", oldfd);
 		return -1;
 	}
 
-	if (!DuplicateHandle(GetCurrentProcess(), src, GetCurrentProcess(), &target, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+	if (!fileio_DuplicateHandle(src, &target)) {
 		errno = EOTHER;
 		debug3("dup - ERROR: DuplicatedHandle() :%d", GetLastError());
 		return -1;
@@ -838,7 +875,28 @@ w32_dup(int oldfd)
 
 	memset(pio, 0, sizeof(struct w32_io));
 	pio->handle = target;
-	pio->type = fd_table.w32_ios[oldfd]->type;
+	pio->type = poio->type;
+
+    if (poio->read_overlapped.hEvent && !fileio_DuplicateHandle(
+                poio->read_overlapped.hEvent,
+                &pio->read_overlapped.hEvent
+            )) {
+        debug3("dup - ERROR: DuplicateHandle(read): %d", GetLastError());
+        goto failure;
+    }
+    if (poio->write_overlapped.hEvent && !fileio_DuplicateHandle(
+                poio->write_overlapped.hEvent,
+                &pio->write_overlapped.hEvent
+            )) {
+        debug3("dup - ERROR: DuplicateHandle(write): %d", GetLastError());
+        goto failure;
+    }
+
+    goto success;
+failure:
+    free(pio);
+    return -1;
+success:
 	fd_table_set(pio, min_index);
 	return min_index;
 }

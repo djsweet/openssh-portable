@@ -165,3 +165,8 @@ int fileio_fstat(struct w32_io* pio, struct _stat64 *buf);
 int fileio_stat(const char *path, struct _stat64 *buf);
 long fileio_lseek(struct w32_io* pio, long offset, int origin);
 FILE* fileio_fdopen(struct w32_io* pio, const char *mode);
+
+/* Helpers for setting wait events in fileio */
+BOOL fileio_set_read_event(struct w32_io *pio);
+BOOL fileio_set_write_event(struct w32_io *pio);
+BOOL fileio_set_events(struct w32_io *pio);

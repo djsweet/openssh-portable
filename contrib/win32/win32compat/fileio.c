@@ -170,6 +170,138 @@ cleanup:
 	return ret;
 }
 
+/* Creates inheritable event handles for overlapped IO */
+HANDLE
+fileio_CreateEvent()
+{
+    HANDLE ret, token;
+    DWORD  cbDacl;
+    TOKEN_DEFAULT_DACL *pDefaultDacl;
+    SECURITY_DESCRIPTOR sdEventHandle;
+    SECURITY_ATTRIBUTES saEventHandle;
+
+    ret          = 0;
+    cbDacl       = 0;
+    pDefaultDacl = NULL;
+    saEventHandle.nLength        = sizeof(saEventHandle);
+    saEventHandle.bInheritHandle = TRUE;
+    memset(&sdEventHandle, 0, sizeof(sdEventHandle));
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        debug("%s - OpenProcessToken() ERROR: %d", __func__, GetLastError());
+        goto out;
+    }
+    GetTokenInformation(token, TokenDefaultDacl, NULL, 0, &cbDacl);
+    pDefaultDacl = (TOKEN_DEFAULT_DACL*)LocalAlloc(LPTR, cbDacl);
+    if (!pDefaultDacl) {
+        debug(
+            "%s - LocalAlloc() ERROR: %d",
+            __func__,
+            GetLastError()
+        );
+        goto out;
+    }
+    if (!GetTokenInformation(
+                token,
+                TokenDefaultDacl,
+                pDefaultDacl,
+                cbDacl,
+                &cbDacl
+            )) {
+        debug(
+            "%s - GetTokenInformation() ERROR: %d",
+            __func__,
+            GetLastError()
+        );
+        goto out;
+    }
+    if (!InitializeSecurityDescriptor(
+                &sdEventHandle,
+                SECURITY_DESCRIPTOR_REVISION
+            )) {
+        debug(
+            "%s - InitializeSecurityDescriptor() ERROR: %d",
+            __func__,
+            GetLastError()
+        );
+        goto out;
+    }
+    if (!SetSecurityDescriptorDacl(
+                &sdEventHandle,
+                TRUE,
+                pDefaultDacl->DefaultDacl,
+                FALSE
+            )) {
+        debug(
+            "%s - SetSecurityDescriptorDacl() ERROR: %d",
+            __func__,
+            GetLastError()
+        );
+        goto out;
+    }
+    saEventHandle.lpSecurityDescriptor = &sdEventHandle;
+    ret = CreateEvent(&saEventHandle, TRUE, FALSE, NULL);
+
+out:
+    if (pDefaultDacl) {
+        LocalFree(pDefaultDacl);
+    }
+
+    return ret;
+}
+
+BOOL fileio_set_read_event(struct w32_io *pio)
+{
+    HANDLE hEvent = NULL;
+    if (!pio->read_overlapped.hEvent) {
+        hEvent = fileio_CreateEvent();
+        if (!hEvent) {
+            debug(
+                "%s - CreateEvent() ERROR: %d",
+                __func__,
+                GetLastError()
+            );
+            return FALSE;
+        }
+        pio->read_overlapped.hEvent = hEvent;
+    }
+    return TRUE;
+}
+
+BOOL fileio_set_write_event(struct w32_io *pio)
+{
+    HANDLE hEvent;
+    if (!pio->write_overlapped.hEvent) {
+        hEvent = fileio_CreateEvent();
+        if (!hEvent) {
+            debug(
+                "%s - CreateEvent(write) ERROR: %d",
+                __func__,
+                GetLastError()
+            );
+            return FALSE;
+        }
+        pio->write_overlapped.hEvent = hEvent;
+    }
+    return TRUE;
+}
+
+BOOL fileio_set_events(struct w32_io *pio)
+{
+    if (!fileio_set_read_event(pio) || !fileio_set_write_event(pio)) {
+        if (pio->read_overlapped.hEvent) {
+            CloseHandle(pio->read_overlapped.hEvent);
+            pio->read_overlapped.hEvent = 0;
+        }
+        if (pio->write_overlapped.hEvent) {
+            CloseHandle(pio->write_overlapped.hEvent);
+            pio->write_overlapped.hEvent = 0;
+        }
+        return FALSE;
+    }
+    return TRUE;
+}
+
 /* used to name named pipes used to implement pipe() */
 static int pipe_counter = 0;
 
@@ -248,11 +380,29 @@ fileio_pipe(struct w32_io* pio[2])
 	pio_read->handle = read_handle;
 	pio_write->handle = write_handle;
 
+    if (!fileio_set_read_event(pio_read)) {
+        /* POSIX doesn't have a helpful error condition for this case. */
+        debug("%s - set_read_event() ERROR: %d", __func__, GetLastError());
+        errno = ENFILE;
+        goto error;
+    }
+    if (!fileio_set_write_event(pio_write)) {
+        debug("%s - set_write_event() ERROR: %d", __func__, GetLastError());
+        errno = ENFILE;
+        goto error;
+    }
+
 	pio[0] = pio_read;
 	pio[1] = pio_write;
 	return 0;
 
 error:
+    if (pio_read && pio_read->read_overlapped.hEvent) {
+        CloseHandle(pio_read->read_overlapped.hEvent);
+    }
+    if (pio_write && pio_write->write_overlapped.hEvent) {
+        CloseHandle(pio_write->write_overlapped.hEvent);
+    }
 	if (read_handle)
 		CloseHandle(read_handle);
 	if (write_handle)
@@ -471,6 +621,22 @@ fileio_open(const char *path_utf8, int flags, mode_t mode)
 		pio->fd_status_flags = O_NONBLOCK;
 
 	pio->handle = handle;
+
+    if (!fileio_set_events(pio)) {
+        /* POSIX doesn't have a helpful error condition for this case */
+        debug(
+            "%s - fileio_set_events() ERROR: %d",
+            __func__,
+            GetLastError()
+        );
+        errno = ENFILE;
+        goto badevent;
+    }
+    goto cleanup;
+
+badevent:
+    free(pio);
+    pio = NULL;
 cleanup:
 	if ((&cf_flags.securityAttributes != NULL) && (&cf_flags.securityAttributes.lpSecurityDescriptor != NULL))
 		LocalFree(cf_flags.securityAttributes.lpSecurityDescriptor);
@@ -902,9 +1068,39 @@ fileio_close(struct w32_io* pio)
 		return 0;
 	}
 
+    /*
+     * Note that, in the loop below, one or both of the event handles can be 0.
+     * In these cases, the appropriate details.pending should never be set.
+     */
+
+    /* Synchronously drain pending writes */
+    while (pio->write_details.pending && pio->write_details.remaining > 0) {
+        debug4(
+            "fileclose - write io pending: %d bytes (wait %d)",
+            pio->write_details.remaining,
+            pio->write_overlapped.hEvent
+        );
+        WaitForSingleObjectEx(
+            pio->write_overlapped.hEvent,
+            INFINITE,
+            TRUE
+        );
+    }
+    /*
+     * Only writes pose a problem here: close() is supposed to
+     * flush() when done, which is what the above enforces
+     * for asynchronous IO.
+     */
+
 	CancelIo(WINHANDLE(pio));
 	/* let queued APCs (if any) drain */
 	SleepEx(0, TRUE);
+    if (pio->read_overlapped.hEvent) {
+        CloseHandle(pio->read_overlapped.hEvent);
+    }
+    if (pio->write_overlapped.hEvent) {
+        CloseHandle(pio->write_overlapped.hEvent);
+    }
 	CloseHandle(WINHANDLE(pio));
 	/* free up non stdio */
 	if (!IS_STDIO(pio)) {
