@@ -102,7 +102,7 @@
 
 /* Define if your platform needs to skip post auth
  file descriptor passing */
-#define DISABLE_FD_PASSING 1
+/* #undef DISABLE_FD_PASSING */
 
 /* Define if you don't want to use lastlog */
 /* #undef DISABLE_LASTLOG */
@@ -435,7 +435,7 @@
 /* #undef HAVE_GETOPT_OPTRESET */
 
 /* Define if your libraries define getpagesize() */
-#define HAVE_GETPAGESIZE 1
+/* #undef HAVE_GETPAGESIZE */
 
 /* Define to 1 if you have the `getpeereid' function. */
 /* #undef HAVE_GETPEEREID */
@@ -1565,7 +1565,7 @@
 #define _PATH_PASSWD_PROG "/usr/bin/passwd"
 
 /* Specify location of ssh.pid */
-#define _PATH_SSH_PIDDIR "."
+/* #undef _PATH_SSH_PIDDIR */
 
 /* Define if we don't have struct __res_state in resolv.h */
 #define __res_state state
@@ -1691,7 +1691,10 @@
 
 #define HAVE_MBLEN 1
 
-#define SSHDIR "."
+#define _PATH_PRIVSEP_CHROOT_DIR "."
+#define SSHDIR "__PROGRAMDATA__\\ssh"
+#define _PATH_SSH_PIDDIR SSHDIR
 #define _PATH_SFTP_SERVER "sftp-server.exe"
 #define _PATH_SSH_PROGRAM "ssh.exe"
 #define _PATH_LS			"dir"
+#define FORK_NOT_SUPPORTED 1

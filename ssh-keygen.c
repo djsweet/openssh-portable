@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-keygen.c,v 1.307 2017/07/07 03:53:12 djm Exp $ */
+/* $OpenBSD: ssh-keygen.c,v 1.308 2017/11/03 05:14:04 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1994 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -1544,9 +1544,16 @@ do_change_comment(struct passwd *pw)
 	fd = open(identity_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (fd == -1)
 		fatal("Could not save your public key in %s", identity_file);
+#ifdef WINDOWS
+	/* Windows POSIX adpater does not support fdopen() on open(file)*/
+	close(fd);
+	if ((f = fopen(identity_file, "w")) == NULL)
+		fatal("fopen %s failed: %s", identity_file, strerror(errno));
+#else  /* !WINDOWS */
 	f = fdopen(fd, "w");
 	if (f == NULL)
 		fatal("fdopen %s failed: %s", identity_file, strerror(errno));
+#endif  /* !WINDOWS */
 	if ((r = sshkey_write(public, f)) != 0)
 		fatal("write key failed: %s", ssh_err(r));
 	sshkey_free(public);
@@ -1861,7 +1868,7 @@ parse_absolute_time(const char *s)
 		    s, s + 4, s + 6, s + 8, s + 10, s + 12);
 		break;
 	default:
-		fatal("Invalid certificate time format %s", s);
+		fatal("Invalid certificate time format \"%s\"", s);
 	}
 
 	memset(&tm, 0, sizeof(tm));
@@ -1894,8 +1901,8 @@ parse_cert_times(char *timespec)
 
 	/*
 	 * from:to, where
-	 * from := [+-]timespec | YYYYMMDD | YYYYMMDDHHMMSS
-	 *   to := [+-]timespec | YYYYMMDD | YYYYMMDDHHMMSS
+	 * from := [+-]timespec | YYYYMMDD | YYYYMMDDHHMMSS | "always"
+	 *   to := [+-]timespec | YYYYMMDD | YYYYMMDDHHMMSS | "forever"
 	 */
 	from = xstrdup(timespec);
 	to = strchr(from, ':');
@@ -1905,11 +1912,15 @@ parse_cert_times(char *timespec)
 
 	if (*from == '-' || *from == '+')
 		cert_valid_from = parse_relative_time(from, now);
+	else if (strcmp(from, "always") == 0)
+		cert_valid_from = 0;
 	else
 		cert_valid_from = parse_absolute_time(from);
 
 	if (*to == '-' || *to == '+')
 		cert_valid_to = parse_relative_time(to, now);
+	else if (strcmp(to, "forever") == 0)
+		cert_valid_to = ~(u_int64_t)0;
 	else
 		cert_valid_to = parse_absolute_time(to);
 

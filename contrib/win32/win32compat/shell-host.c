@@ -692,7 +692,7 @@ SendCharacter(HANDLE hInput, WORD attributes, wchar_t character)
 
 	StringCbPrintfExA(Next, SizeLeft, &Next, &SizeLeft, 0, ";%u", Color);
 	
-	StringCbPrintfExA(Next, SizeLeft, &Next, &SizeLeft, 0, ";%c", 'm');
+	StringCbPrintfExA(Next, SizeLeft, &Next, &SizeLeft, 0, "%c", 'm');
 
 	if (bUseAnsiEmulation && attributes != pattributes)
 		WriteFile(hInput, formatted_output, (DWORD)(Next - formatted_output), &wr, NULL);
@@ -1312,7 +1312,7 @@ get_default_shell_path()
 	wchar_t *tmp = malloc(PATH_MAX + 1);
 
 	if (!tmp) {
-		printf_s("get_default_shell_path(),  Unable to allocate memory");
+		printf_s("%s: out of memory", __func__);
 		exit(255);
 	}
 
@@ -1365,6 +1365,9 @@ get_default_shell_path()
 
 	if (tmp)
 		free(tmp);
+	
+	if (reg_key)
+		RegCloseKey(reg_key);
 
 	return default_shell_path;
 }
@@ -1642,6 +1645,7 @@ start_withno_pty(wchar_t *command)
 	/* Now that we've passed everything through, wait for the child to exit */
 	WaitForSingleObject(child, INFINITE);
 	GetExitCodeProcess(child, &child_exit_code);
+
 cleanup:
 	if (!IS_INVALID_HANDLE(pipe_in)) {
 		CloseHandle(pipe_in);
@@ -1668,28 +1672,24 @@ static void* xmalloc(size_t size) {
 	return ptr;
 }
 
-#define SET_USER_ENV(folder_id, evn_variable) do  {                \
-       if (SHGetKnownFolderPath(&folder_id,0,NULL,&path) == S_OK)              \
-        {                                                                       \
-                SetEnvironmentVariableW(evn_variable, path);                    \
-                CoTaskMemFree(path);                                            \
-       }                                                                        \
-} while (0)
-
 /* set user environment variables from user profile */
-static void setup_session_user_vars()	
+static void setup_session_user_vars()
 {
 	/* retrieve and set env variables. */
 	HKEY reg_key = 0;
-	wchar_t *path;
 	wchar_t name[256];
+	wchar_t userprofile_path[PATH_MAX + 1] = { 0, }, path[PATH_MAX + 1] = { 0, };
 	wchar_t *data = NULL, *data_expanded = NULL, *path_value = NULL, *to_apply;
 	DWORD type, name_chars = 256, data_chars = 0, data_expanded_chars = 0, required, i = 0;
 	LONG ret;
-
-	SET_USER_ENV(FOLDERID_LocalAppData, L"LOCALAPPDATA");
-	SET_USER_ENV(FOLDERID_Profile, L"USERPROFILE");
-	SET_USER_ENV(FOLDERID_RoamingAppData, L"APPDATA");
+	DWORD len = GetCurrentDirectory(_countof(userprofile_path), userprofile_path);
+	if (len > 0) {
+		SetEnvironmentVariableW(L"USERPROFILE", userprofile_path);
+		swprintf_s(path, _countof(path), L"%s\\AppData\\Local", userprofile_path);
+		SetEnvironmentVariableW(L"LOCALAPPDATA", path);
+		swprintf_s(path, _countof(path), L"%s\\AppData\\Roaming", userprofile_path);
+		SetEnvironmentVariableW(L"APPDATA", path);
+	}
 
 	ret = RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_QUERY_VALUE, &reg_key);
 	if (ret != ERROR_SUCCESS)
@@ -1809,7 +1809,7 @@ wmain(int ac, wchar_t **av)
 	}
 
 	memset(&job_info, 0, sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
-	job_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+	job_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
 
 	if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &job_info, sizeof(job_info)) ||
 		!AssignProcessToJobObject(job, GetCurrentProcess())) {

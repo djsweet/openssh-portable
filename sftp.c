@@ -1,4 +1,4 @@
-/* $OpenBSD: sftp.c,v 1.180 2017/06/10 06:33:34 djm Exp $ */
+/* $OpenBSD: sftp.c,v 1.182 2017/11/03 03:46:52 djm Exp $ */
 /*
  * Copyright (c) 2001-2004 Damien Miller <djm@openbsd.org>
  *
@@ -217,8 +217,6 @@ static const struct CMD cmds[] = {
 	{ NULL,		-1,		-1	}
 };
 
-int interactive_loop(struct sftp_conn *, char *file1, char *file2);
-
 /* ARGSUSED */
 static void
 killchild(int signo)
@@ -399,7 +397,7 @@ make_absolute(char *p, const char *pwd)
 	* Need to follow up with community if this makes sense in common code
 	*/
 	char *s1, *s2;
-	if (p && p[0] != '/' && (p[0] == '\0' || p[1] != ':')) {
+	if (!is_absolute_path(p)) {
 		abs_str = path_append(pwd, p);
 		free(p);
 		p = abs_str;
@@ -1336,7 +1334,7 @@ parse_args(const char **cpp, int *ignore_errors, int *aflag,
 	char *cp2, **argv;
 	int base = 0;
 	long l;
-	int i, cmdnum, optidx, argc;
+	int path1_mandatory = 0, i, cmdnum, optidx, argc;
 
 	/* Skip leading whitespace */
 	cp = cp + strspn(cp, WHITESPACE);
@@ -1426,13 +1424,17 @@ parse_args(const char **cpp, int *ignore_errors, int *aflag,
 	case I_RM:
 	case I_MKDIR:
 	case I_RMDIR:
+	case I_LMKDIR:
+		path1_mandatory = 1;
+		/* FALLTHROUGH */
 	case I_CHDIR:
 	case I_LCHDIR:
-	case I_LMKDIR:
 		if ((optidx = parse_no_flags(cmd, argv, argc)) == -1)
 			return -1;
 		/* Get pathname (mandatory) */
 		if (argc - optidx < 1) {
+			if (!path1_mandatory)
+				break; /* return a NULL path1 */
 			error("You must specify a path after a %s command.",
 			    cmd);
 			return -1;
@@ -1517,7 +1519,7 @@ parse_args(const char **cpp, int *ignore_errors, int *aflag,
 
 static int
 parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
-    int err_abort)
+    const char *startdir, int err_abort)
 {
 	char *path1, *path2, *tmp;
 	int ignore_errors = 0, aflag = 0, fflag = 0, hflag = 0,
@@ -1604,6 +1606,8 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		err = do_rmdir(conn, path1);
 		break;
 	case I_CHDIR:
+		if (path1 == NULL || *path1 == '\0')
+			path1 = xstrdup(startdir);
 		path1 = make_absolute(path1, *pwd);
 		if ((tmp = do_realpath(conn, path1)) == NULL) {
 			err = 1;
@@ -1652,6 +1656,8 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		err = do_df(conn, path1, hflag, iflag);
 		break;
 	case I_LCHDIR:
+		if (path1 == NULL || *path1 == '\0')
+			path1 = xstrdup("~");
 		tmp = tilde_expand_filename(path1, getuid());
 		free(path1);
 		path1 = tmp;
@@ -2138,11 +2144,11 @@ complete(EditLine *el, int ch)
 }
 #endif /* USE_LIBEDIT */
 
-int
+static int
 interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 {
 	char *remote_path;
-	char *dir = NULL;
+	char *dir = NULL, *startdir = NULL;
 	char cmd[2048];
 	int err, interactive;
 	EditLine *el = NULL;
@@ -2186,6 +2192,7 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 	remote_path = do_realpath(conn, ".");
 	if (remote_path == NULL)
 		fatal("Need cwd");
+	startdir = xstrdup(remote_path);
 
 	if (file1 != NULL) {
 		dir = xstrdup(file1);
@@ -2196,8 +2203,9 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 				mprintf("Changing to: %s\n", dir);
 			snprintf(cmd, sizeof cmd, "cd \"%s\"", dir);
 			if (parse_dispatch_command(conn, cmd,
-			    &remote_path, 1) != 0) {
+			    &remote_path, startdir, 1) != 0) {
 				free(dir);
+				free(startdir);
 				free(remote_path);
 				free(conn);
 				return (-1);
@@ -2209,8 +2217,9 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 			    file2 == NULL ? "" : " ",
 			    file2 == NULL ? "" : file2);
 			err = parse_dispatch_command(conn, cmd,
-			    &remote_path, 1);
+			    &remote_path, startdir, 1);
 			free(dir);
+			free(startdir);
 			free(remote_path);
 			free(conn);
 			return (err);
@@ -2269,11 +2278,12 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 		signal(SIGINT, cmd_interrupt);
 
 		err = parse_dispatch_command(conn, cmd, &remote_path,
-		    batchmode);
+		    startdir, batchmode);
 		if (err != 0)
 			break;
 	}
 	free(remote_path);
+	free(startdir);
 	free(conn);
 
 #ifdef USE_LIBEDIT
@@ -2299,6 +2309,10 @@ connect_to_server(char *path, char **args, int *in, int *out)
 	*out = pout[1];
 	c_in = pout[0];
 	c_out = pin[1];
+	fcntl(pout[0], F_SETFD, FD_CLOEXEC);
+	fcntl(pout[1], F_SETFD, FD_CLOEXEC);
+	fcntl(pin[0], F_SETFD, FD_CLOEXEC);
+	fcntl(pin[1], F_SETFD, FD_CLOEXEC);
 #else /* USE_PIPES */
 	int inout[2];
 
@@ -2306,19 +2320,27 @@ connect_to_server(char *path, char **args, int *in, int *out)
 		fatal("socketpair: %s", strerror(errno));
 	*in = *out = inout[0];
 	c_in = c_out = inout[1];
+	fcntl(inout[0], F_SETFD, FD_CLOEXEC);
+	fcntl(inout[1], F_SETFD, FD_CLOEXEC);
 #endif /* USE_PIPES */
 
-#ifdef WINDOWS
-	/* fork replacement on Windows */
-	/* disable inheritance on local pipe ends*/
-	fcntl(pout[1], F_SETFD, FD_CLOEXEC);
-	fcntl(pin[0], F_SETFD, FD_CLOEXEC);
 
-	sshpid = spawn_child(path, args + 1, c_in, c_out, STDERR_FILENO, 0);
-	if (sshpid == -1)
-#else /* !WINDOWS */
+#ifdef FORK_NOT_SUPPORTED
+	{
+		posix_spawn_file_actions_t actions;
+		sshpid = -1;
+
+		if (posix_spawn_file_actions_init(&actions) != 0 ||
+		    posix_spawn_file_actions_adddup2(&actions, c_in, STDIN_FILENO) != 0 ||
+		    posix_spawn_file_actions_adddup2(&actions, c_out, STDOUT_FILENO) != 0 ) 
+			fatal("posix_spawn initialization failed");
+		else if (posix_spawn(&sshpid, path, &actions, NULL, args, NULL) != 0) 
+			fatal("posix_spawn: %s", strerror(errno));
+		
+		posix_spawn_file_actions_destroy(&actions);
+	}
+#else 
 	if ((sshpid = fork()) == -1)
-#endif  /* !WINDOWS */
 		fatal("fork: %s", strerror(errno));
 	else if (sshpid == 0) {
 		if ((dup2(c_in, STDIN_FILENO) == -1) ||
@@ -2344,7 +2366,7 @@ connect_to_server(char *path, char **args, int *in, int *out)
 		fprintf(stderr, "exec: %s: %s\n", path, strerror(errno));
 		_exit(1);
 	}
-
+#endif
 	signal(SIGTERM, killchild);
 	signal(SIGINT, killchild);
 	signal(SIGHUP, killchild);
@@ -2366,19 +2388,16 @@ usage(void)
 	    "[-i identity_file] [-l limit]\n"
 	    "          [-o ssh_option] [-P port] [-R num_requests] "
 	    "[-S program]\n"
-	    "          [-s subsystem | sftp_server] host\n"
-	    "       %s [user@]host[:file ...]\n"
-	    "       %s [user@]host[:dir[/]]\n"
-	    "       %s -b batchfile [user@]host\n",
-	    __progname, __progname, __progname, __progname);
+	    "          [-s subsystem | sftp_server] destination\n",
+	    __progname);
 	exit(1);
 }
 
 int
 main(int argc, char **argv)
 {
-	int in, out, ch, err;
-	char *host = NULL, *userhost, *cp, *file2 = NULL;
+	int in, out, ch, err, tmp, port = -1;
+	char *host = NULL, *user, *cp, *file2 = NULL;
 	int debug_level = 0, sshver = 2;
 	char *file1 = NULL, *sftp_server = NULL;
 	char *ssh_program = _PATH_SSH_PROGRAM, *sftp_direct = NULL;
@@ -2433,7 +2452,9 @@ main(int argc, char **argv)
 			addargs(&args, "-%c", ch);
 			break;
 		case 'P':
-			addargs(&args, "-oPort %s", optarg);
+			port = a2port(optarg);
+			if (port <= 0)
+				fatal("Bad port \"%s\"\n", optarg);
 			break;
 		case 'v':
 			if (debug_level < 3) {
@@ -2516,34 +2537,41 @@ main(int argc, char **argv)
 	if (sftp_direct == NULL) {
 		if (optind == argc || argc > (optind + 2))
 			usage();
+		argv += optind;
 
-		userhost = xstrdup(argv[optind]);
-		if(argc > optind + 1)
-			file2 = argv[optind+1];
-
-		if ((host = strrchr(userhost, '@')) == NULL)
-			host = userhost;
-		else {
-			*host++ = '\0';
-			if (!userhost[0]) {
-				fprintf(stderr, "Missing username\n");
-				usage();
+		switch (parse_uri("sftp", *argv, &user, &host, &tmp, &file1)) {
+		case -1:
+			usage();
+			break;
+		case 0:
+			if (tmp != -1)
+				port = tmp;
+			break;
+		default:
+			if (parse_user_host_path(*argv, &user, &host,
+			    &file1) == -1) {
+				/* Treat as a plain hostname. */
+				host = xstrdup(*argv);
+				host = cleanhostname(host);
 			}
-			addargs(&args, "-l");
-			addargs(&args, "%s", userhost);
+			break;
 		}
+		
+		/* TODO: need to debug this. this parameter doesn't make sense
+		file2 = *(argv + 1);
+		*/
 
-		if ((cp = colon(host)) != NULL) {
-			*cp++ = '\0';
-			file1 = cp;
-		}
-
-		host = cleanhostname(host);
 		if (!*host) {
 			fprintf(stderr, "Missing hostname\n");
 			usage();
 		}
 
+		if (port != -1)
+			addargs(&args, "-oPort %d", port);
+		if (user != NULL) {
+			addargs(&args, "-l");
+			addargs(&args, "%s", user);
+		}
 		addargs(&args, "-oProtocol %d", sshver);
 
 		/* no subsystem if the server-spec contains a '/' */

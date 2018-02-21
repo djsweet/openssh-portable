@@ -1,6 +1,6 @@
 /*
 * Author: Manoj Ampalam <manoj.ampalam@microsoft.com>
-* ssh-agent implementation on Windows
+* Utitilites to generate user tokens
 *
 * Copyright (c) 2015 Microsoft Corp.
 * All rights reserved
@@ -35,20 +35,21 @@
 #include <Ntsecapi.h>
 #include <ntstatus.h>
 #include <Shlobj.h>
-#include "agent.h"
-#include "agent-request.h"
-#include "key.h"
+#include <LM.h>
+
 #include "inc\utf.h"
-#include "..\priv-agent.h"
+#include "logonuser.h"
+#include <Ntsecapi.h>
+#include <ntstatus.h>
+#include "misc_internal.h"
+#include "Debug.h"
 
 #pragma warning(push, 3)
-
-int pubkey_allowed(struct sshkey* pubkey, char*  user_utf8);
 
 static void
 InitLsaString(LSA_STRING *lsa_string, const char *str)
 {
-	if (str == NULL)
+	if (!str)
 		memset(lsa_string, 0, sizeof(LSA_STRING));
 	else {
 		lsa_string->Buffer = (char *)str;
@@ -134,7 +135,7 @@ generate_user_token(wchar_t* user_cpn) {
 
 	domain_user = wcschr(user_cpn, L'@')? TRUE : FALSE;
 
-	InitLsaString(&logon_process_name, "ssh-agent");
+	InitLsaString(&logon_process_name, "sshd");
 	if (domain_user)
 		InitLsaString(&auth_package_name, MICROSOFT_KERBEROS_NAME_A);
 	else
@@ -188,7 +189,7 @@ generate_user_token(wchar_t* user_cpn) {
 			goto done;
 	}
 
-	if(memcpy_s(sourceContext.SourceName, TOKEN_SOURCE_LENGTH, "sshagent", sizeof(sourceContext.SourceName)))
+	if(memcpy_s(sourceContext.SourceName, TOKEN_SOURCE_LENGTH, "sshd", sizeof(sourceContext.SourceName)))
 		goto done;
 
 	if (AllocateLocallyUniqueId(&sourceContext.SourceIdentifier) != TRUE)
@@ -223,53 +224,116 @@ done:
 	return token;
 }
 
-static HANDLE
-duplicate_token_for_client(struct agent_connection* con, HANDLE t) {
-	ULONG client_pid;
-	HANDLE client_proc = NULL, dup_t = NULL;
+HANDLE
+process_custom_lsa_auth(const char* user, const char* pwd, const char* lsa_pkg)
+{
+	wchar_t *providerw = NULL;
+	HANDLE token = NULL, lsa_handle = NULL;
+	LSA_OPERATIONAL_MODE mode;
+	ULONG auth_package_id, logon_info_size = 0;
+	NTSTATUS ret, subStatus;
+	wchar_t *logon_info_w = NULL;
+	LSA_STRING logon_process_name, lsa_auth_package_name, originName;
+	TOKEN_SOURCE sourceContext;
+	PVOID pProfile = NULL;
+	LUID logonId;
+	QUOTA_LIMITS quotas;
+	DWORD cbProfile;
+	int retVal = -1;
+	char *domain = NULL, *logon_info = NULL, user_name[UNLEN] = { 0, }, *tmp = NULL;
 
-	/* Should the token match client's session id?
-	ULONG client_sessionId;
-	if (GetNamedPipeClientSessionId(con->pipe_handle, &client_sessionId) == FALSE ||
-	    SetTokenInformation(t, TokenSessionId, &client_sessionId, sizeof(client_sessionId)) == FALSE) {
-		error("unable to set token session id, error: %d", GetLastError());
-		goto done;
-	}*/
+	debug3("LSA auth request, user:%s lsa_pkg:%s ", user, lsa_pkg);
 
-	if ((FALSE == GetNamedPipeClientProcessId(con->pipe_handle, &client_pid)) ||
-		((client_proc = OpenProcess(PROCESS_DUP_HANDLE, FALSE, client_pid)) == NULL) ||
-		DuplicateHandle(GetCurrentProcess(), t, client_proc, &dup_t, TOKEN_QUERY | TOKEN_IMPERSONATE, FALSE, DUPLICATE_SAME_ACCESS) == FALSE ) {
-		error("failed to duplicate user token");
+	logon_info_size = (ULONG)(strlen(user) + strlen(pwd) + 2); // 1 - ";", 1 - "\0"
+	strcpy_s(user_name, _countof(user_name), user);
+	if (tmp = strstr(user_name, "@")) {
+		domain = tmp + 1;
+		*tmp = '\0';
+		logon_info_size++; // 1 - ";"
+	}
+
+	logon_info = malloc(logon_info_size);
+	if(!logon_info)
+		fatal("%s out of memory", __func__);
+
+	strcpy_s(logon_info, logon_info_size, user_name);
+	strcat_s(logon_info, logon_info_size, ";");
+	strcat_s(logon_info, logon_info_size, pwd);
+
+	if (domain) {
+		strcat_s(logon_info, logon_info_size, ";");
+		strcat_s(logon_info, logon_info_size, domain);
+	}
+
+	if (NULL == (logon_info_w = utf8_to_utf16(logon_info))) {
+		error("utf8_to_utf16 failed to convert %s", logon_info);
 		goto done;
 	}
 
+	/* call into LSA provider , get and duplicate token */
+	InitLsaString(&logon_process_name, "sshd");
+	InitLsaString(&lsa_auth_package_name, lsa_pkg);
+	InitLsaString(&originName, "sshd");
+
+	if ((ret = LsaRegisterLogonProcess(&logon_process_name, &lsa_handle, &mode)) != STATUS_SUCCESS) {
+		error("LsaRegisterLogonProcess failed, error:%x", ret);
+		goto done;
+	}
+
+	if ((ret = LsaLookupAuthenticationPackage(lsa_handle, &lsa_auth_package_name, &auth_package_id)) != STATUS_SUCCESS) {
+		error("LsaLookupAuthenticationPackage failed, lsa auth pkg:%ls error:%x", lsa_pkg, ret);
+		goto done;
+	}
+
+	memcpy(sourceContext.SourceName, "sshd", sizeof(sourceContext.SourceName));
+
+	if (!AllocateLocallyUniqueId(&sourceContext.SourceIdentifier)) {
+		error("AllocateLocallyUniqueId failed, error:%d", GetLastError());
+		goto done;
+	}
+
+	if ((ret = LsaLogonUser(lsa_handle,
+		&originName,
+		Network,
+		auth_package_id,
+		logon_info_w,
+		logon_info_size * sizeof(wchar_t),
+		NULL,
+		&sourceContext,
+		&pProfile,
+		&cbProfile,
+		&logonId,
+		&token,
+		&quotas,
+		&subStatus)) != STATUS_SUCCESS) {
+		if (ret == STATUS_ACCOUNT_RESTRICTION)
+			error("LsaLogonUser failed, error:%x subStatus:%ld", ret, subStatus);
+		else
+			error("LsaLogonUser failed error:%x", ret);
+
+		goto done;
+	}
+
+	debug3("LSA auth request is successful for user:%s ", user);
+	retVal = 0;
 done:
-	if (client_proc)
-		CloseHandle(client_proc);
-	return dup_t;
+	if (lsa_handle)
+		LsaDeregisterLogonProcess(lsa_handle);
+	if (pProfile)
+		LsaFreeReturnBuffer(pProfile);
+	if (logon_info)
+		free(logon_info);
+	if (logon_info_w)
+		free(logon_info_w);
+
+	return token;
 }
 
-int process_pubkeyauth_request(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) {
-	int r = -1;
-	char *key_blob, *user, *sig, *blob;
-	size_t key_blob_len, user_len, sig_len, blob_len;
-	struct sshkey *key = NULL;
-	HANDLE token = NULL, dup_token = NULL;
+HANDLE
+get_user_token(char* user) {
+	HANDLE token = NULL;
 	wchar_t *user_utf16 = NULL;
-	PWSTR wuser_home = NULL;
 	
-
-	user = NULL;
-	if (sshbuf_get_string_direct(request, &key_blob, &key_blob_len) != 0 ||
-	    sshbuf_get_cstring(request, &user, &user_len) != 0 ||
-	    user_len > MAX_USER_LEN ||
-	    sshbuf_get_string_direct(request, &sig, &sig_len) != 0 ||
-	    sshbuf_get_string_direct(request, &blob, &blob_len) != 0 ||
-	    sshkey_from_blob(key_blob, key_blob_len, &key) != 0) {
-		debug("invalid pubkey auth request");
-		goto done;
-	}
-
 	if ((user_utf16 = utf8_to_utf16(user)) == NULL) {
 		debug("out of memory");
 		goto done;
@@ -278,77 +342,26 @@ int process_pubkeyauth_request(struct sshbuf* request, struct sshbuf* response, 
 	if ((token = generate_user_token(user_utf16)) == 0) {
 		error("unable to generate token for user %ls", user_utf16);
 		/* work around for https://github.com/PowerShell/Win32-OpenSSH/issues/727 by doing a fake login */
-		LogonUserW(L"FakeUser", L"FakeDomain", L"FakePasswd",
-			LOGON32_LOGON_NETWORK_CLEARTEXT, LOGON32_PROVIDER_DEFAULT, &token);
+		LogonUserExExWHelper(L"FakeUser", L"FakeDomain", L"FakePasswd",
+			LOGON32_LOGON_NETWORK_CLEARTEXT, LOGON32_PROVIDER_DEFAULT, NULL, &token, NULL, NULL, NULL, NULL);
 		if ((token = generate_user_token(user_utf16)) == 0) {
 			error("unable to generate token on 2nd attempt for user %ls", user_utf16);
 			goto done;
 		}
 	}
 
-	
-	if (pubkey_allowed(key, user) != 1) {
-		debug("unable to verify public key for user %ls (profile:%ls)", user_utf16, wuser_home);
-		goto done;
-	}
-
-	if (key_verify(key, sig, (u_int)sig_len, blob, (u_int)blob_len) != 1) {
-		debug("signature verification failed");
-		goto done;
-	}
-
-	if ((dup_token = duplicate_token_for_client(con, token)) == NULL)
-		goto done;
-
-	if (sshbuf_put_u32(response, (int)(intptr_t)dup_token) != 0)
-		goto done;
-
-	r = 0;
 done:
-	/* TODO Fix this hacky protocol*/
-	if ((r == -1) && (sshbuf_put_u8(response, SSH_AGENT_FAILURE) == 0))
-		r = 0;
-
-	if (user)
-		free(user);
 	if (user_utf16)
 		free(user_utf16);
-	if (key)
-		sshkey_free(key);
-	if (wuser_home)
-		CoTaskMemFree(wuser_home);
-	if (token)
-		CloseHandle(token);
-	return r;
+
+	return token;
 }
 
-int process_loadprofile_request(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) {
-	int r = 0, success = 0;
-	char *user;
-	size_t user_len;
-	u_int32_t user_token_int = 0;
-	HANDLE user_token = NULL;
+int load_user_profile(HANDLE user_token, char* user) {
+	int r = 0;
+	HANDLE profile_handle = NULL;
 	wchar_t *user_utf16 = NULL, *dom_utf16 = NULL, *tmp;
 
-	/* is profile already loaded */
-	if (con->profile_handle) {
-		success = 1;
-		goto done;
-	}
-	
-	if (sshbuf_get_cstring(request, &user, &user_len) != 0 ||
-	    user_len > MAX_USER_LEN ||
-	    sshbuf_get_u32(request, &user_token_int) != 0){
-		debug("invalid loadprofile request");
-		goto done;
-	}
-	
-	if (DuplicateHandle(con->client_process_handle, (HANDLE)(INT_PTR)user_token_int, GetCurrentProcess(),
-		&user_token, TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_DUPLICATE, FALSE, 0) == FALSE) {
-		debug("cannot duplicate user token, error: %d", GetLastError());
-		goto done;
-	}
-	
 	if ((user_utf16 = utf8_to_utf16(user)) == NULL) {
 		debug("out of memory");
 		goto done;
@@ -360,43 +373,13 @@ int process_loadprofile_request(struct sshbuf* request, struct sshbuf* response,
 		*tmp = L'\0';
 	}
 
-	if ((con->profile_handle = LoadProfile(user_token, user_utf16, dom_utf16)) == NULL)
+	if ((profile_handle = LoadProfile(user_token, user_utf16, dom_utf16)) == NULL)
 		goto done;
-	
-	con->profile_token = user_token;
-	user_token = NULL;
-	success = 1;
+
 done:
-	if (sshbuf_put_u8(response, success ? SSH_AGENT_SUCCESS : SSH_AGENT_FAILURE) != 0)
-		r = -1;
-
-	if (user_token)
-		CloseHandle(user_token);
+	if (user_utf16)
+		free(user_utf16);
 	return r;
-}
-
-int process_privagent_request(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) {
-	char *opn;
-	size_t opn_len;
-	if (sshbuf_get_string_direct(request, &opn, &opn_len) != 0) {
-		debug("invalid auth request");
-		return -1;
-	}
-
-	/* allow only admins and NT Service\sshd to send auth requests */
-	if (con->client_type != SSHD_SERVICE && con->client_type != ADMIN_USER) {
-		error("cannot process request: client process is not admin or sshd");
-		return -1;
-	}
-		
-	if (memcmp(opn, PUBKEY_AUTH_REQUEST, opn_len) == 0)
-		return process_pubkeyauth_request(request, response, con);
-	else if (memcmp(opn, LOAD_USER_PROFILE_REQUEST, opn_len) == 0)
-		return process_loadprofile_request(request, response, con);
-	else {
-		debug("unknown auth request: %s", opn);
-		return -1;
-	}
 }
 
 #pragma warning(pop)

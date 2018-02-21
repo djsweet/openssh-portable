@@ -1,4 +1,4 @@
-/* $OpenBSD: monitor.c,v 1.174 2017/10/02 19:33:20 djm Exp $ */
+/* $OpenBSD: monitor.c,v 1.175 2017/10/05 15:52:03 djm Exp $ */
 /*
  * Copyright 2002 Niels Provos <provos@citi.umich.edu>
  * Copyright 2002 Markus Friedl <markus@openbsd.org>
@@ -760,12 +760,10 @@ mm_answer_pwnamallow(int sock, Buffer *m)
 		for (i = 0; i < options.nx; i++) \
 			buffer_put_cstring(m, options.x[i]); \
 	} while (0)
-#define M_CP_STRARRAYOPT_ALLOC(x, nx) M_CP_STRARRAYOPT(x, nx)
 	/* See comment in servconf.h */
 	COPY_MATCH_STRING_OPTS();
 #undef M_CP_STROPT
 #undef M_CP_STRARRAYOPT
-#undef M_CP_STRARRAYOPT_ALLOC
 
 	/* Create valid auth method lists */
 	if (auth2_setup_methods_lists(authctxt) != 0) {
@@ -1586,6 +1584,43 @@ mm_answer_audit_command(int socket, Buffer *m)
 	return (0);
 }
 #endif /* SSH_AUDIT_EVENTS */
+
+void
+monitor_send_keystate(struct monitor *pmonitor) {
+	struct sshbuf *m;
+	int r;
+
+	if ((m = sshbuf_new()) == NULL)
+		fatal("%s: sshbuf_new failed", __func__);
+	if ((r = sshbuf_put_stringb(m, child_state)) != 0)
+		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+
+	if (ssh_msg_send(pmonitor->m_sendfd, 0, m) == -1)
+		fatal("%s: ssh_msg_send failed", __func__);
+
+	sshbuf_free(m);
+}
+
+void 
+monitor_recv_keystate(struct monitor*pmonitor) {
+	Buffer m;
+	char *cp;
+	u_int len;
+
+	buffer_init(&m);
+
+	if (ssh_msg_recv(pmonitor->m_recvfd, &m) == -1)
+		fatal("%s: ssh_msg_recv failed", __func__);
+	if (buffer_get_char(&m) != 0)
+		fatal("%s: recv_keystate version mismatch", __func__);
+
+	cp = buffer_get_string(&m, &len);
+	child_state = sshbuf_new();
+	buffer_append(child_state, cp, len);
+	free(cp);
+	buffer_free(&m);
+}
+
 
 void
 monitor_clear_keystate(struct monitor *pmonitor)
