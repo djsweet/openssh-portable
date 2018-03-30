@@ -112,13 +112,15 @@ Describe "Tests of sshd_config" -Tags "CI" {
                 }
             }
         }
-        $platform = Get-Platform
-        $skip = ($platform -eq [PlatformType]::Windows) -and ($PSVersionTable.PSVersion.Major -le 2)
+        
+        #skip when the task schedular (*-ScheduledTask) cmdlets does not exist
+        $ts = (get-command get-ScheduledTask -ErrorAction SilentlyContinue)
+        $skip = $ts -eq $null
         if(-not $skip)
         {
             Stop-SSHDTestDaemon
         }
-        if(($platform -eq [PlatformType]::Windows) -and ($psversiontable.BuildVersion.Major -le 6))
+        if(($platform -eq [PlatformType]::Windows) -and ([Environment]::OSVersion.Version.Major -le 6))
         {
             #suppress the firewall blocking dialogue on win7
             netsh advfirewall firewall add rule name="sshd" program="$($OpenSSHTestInfo['OpenSSHBinPath'])\sshd.exe" protocol=any action=allow dir=in
@@ -329,6 +331,20 @@ Describe "Tests of sshd_config" -Tags "CI" {
            
            Remove-UserFromLocalGroup -UserName $localuser3 -GroupName $denyGroup3
 
+        }
+
+        It "$tC.$tI - Match User block with ForceCommand" -skip:$skip  {
+            Start-SSHDTestDaemon -WorkDir $opensshbinpath -Arguments "-d -f $sshdConfigPath -E $sshdlog" 
+            $matchuser = "matchuser"
+            Add-UserToLocalGroup -UserName $matchuser -Password $password -GroupName $allowGroup1
+
+            $o = ssh  -p $port -T -o "UserKnownHostsFile $testknownhosts" $matchuser@$server randomcommand
+            # Match block's ForceCommand returns output of "whoami & set SSH_ORIGINAL_COMMAND"
+            $o[0].Contains($matchuser) | Should Be $true
+            $o[1].Contains("randomcommand") | Should Be $true
+            
+            Stop-SSHDTestDaemon
+            Remove-UserFromLocalGroup -UserName $matchuser -GroupName $allowGroup1
         }
 #>
     }

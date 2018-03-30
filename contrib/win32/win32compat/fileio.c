@@ -1,6 +1,9 @@
 /*
 * Author: Manoj Ampalam <manoj.ampalam@microsoft.com>
 *
+* Author: Bryan Berns <berns@uwalumni.com>
+*  Added symlink support
+*
 * Copyright (c) 2015 Microsoft Corp.
 * All rights reserved
 *
@@ -84,6 +87,7 @@ int
 errno_from_Win32Error(int win32_error)
 {
 	switch (win32_error) {
+	case ERROR_PRIVILEGE_NOT_HELD:
 	case ERROR_ACCESS_DENIED:
 		return EACCES;
 	case ERROR_OUTOFMEMORY:
@@ -752,11 +756,14 @@ fileio_fstat(struct w32_io* pio, struct _stat64 *buf)
 }
 
 int
-fileio_stat(const char *path, struct _stat64 *buf)
+fileio_stat_or_lstat_internal(const char *path, struct _stat64 *buf, int do_lstat)
 {
-	wchar_t* wpath = NULL;
+	wchar_t *wpath = NULL;
+	char link_test = L'\0';
+	HANDLE link_handle = INVALID_HANDLE_VALUE;
 	WIN32_FILE_ATTRIBUTE_DATA attributes = { 0 };
-	int ret = -1, len = 0;	
+	int ret = -1;
+	int is_link = 0;
 
 	memset(buf, 0, sizeof(struct _stat64));
 
@@ -773,13 +780,38 @@ fileio_stat(const char *path, struct _stat64 *buf)
 		return -1;
 	}
 
+	/* get the file attributes (or symlink attributes if symlink) */
 	if (GetFileAttributesExW(wpath, GetFileExInfoStandard, &attributes) == FALSE) {
 		errno = errno_from_Win32LastError();
-		debug3("GetFileAttributesExW with last error %d", GetLastError());
 		goto cleanup;
 	}
-	
-	len = (int)wcslen(wpath);
+
+	/* try to see if it is a symlink */
+	is_link = (attributes.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT &&
+		fileio_readlink(path, &link_test, 1) == 1);
+
+	/* if doing a stat() on a link, then lookup attributes on the target of the link */
+	if (!do_lstat && is_link) {
+
+		/* obtain a file handle to the destination file (not the source link) */
+		BY_HANDLE_FILE_INFORMATION link_attributes;
+		if ((link_handle = CreateFileW(wpath, 0, 0, NULL, OPEN_EXISTING, 
+			FILE_FLAG_BACKUP_SEMANTICS, NULL)) == INVALID_HANDLE_VALUE 
+			|| GetFileInformationByHandle(link_handle, &link_attributes) == 0)
+		{
+			errno = errno_from_Win32LastError();
+			goto cleanup;
+		}
+
+		/* copy attributes from handle structure to normal structure */
+		attributes.ftCreationTime = link_attributes.ftCreationTime;
+		attributes.ftLastAccessTime = link_attributes.ftLastAccessTime;
+		attributes.ftLastWriteTime = link_attributes.ftLastWriteTime;
+		attributes.nFileSizeHigh = link_attributes.nFileSizeHigh;
+		attributes.nFileSizeLow = link_attributes.nFileSizeLow;
+		attributes.dwFileAttributes = link_attributes.dwFileAttributes;
+		is_link = 0;
+	}
 
 	buf->st_ino = 0; /* Has no meaning in the FAT, HPFS, or NTFS file systems*/
 	buf->st_gid = 0; /* UNIX - specific; has no meaning on windows */
@@ -787,7 +819,7 @@ fileio_stat(const char *path, struct _stat64 *buf)
 	buf->st_nlink = 1; /* number of hard links. Always 1 on non - NTFS file systems.*/
 	buf->st_mode |= file_attr_to_st_mode(wpath, attributes.dwFileAttributes);
 	buf->st_size = attributes.nFileSizeLow | (((off_t)attributes.nFileSizeHigh) << 32);
-	if (len > 1 && __ascii_iswalpha(*wpath) && (*(wpath + 1) == ':'))
+	if (wcslen(wpath) > 1 && __ascii_iswalpha(*wpath) && (*(wpath + 1) == ':'))
 		buf->st_dev = buf->st_rdev = towupper(*wpath) - L'A'; /* drive num */
 	else
 		buf->st_dev = buf->st_rdev = _getdrive() - 1;
@@ -795,22 +827,32 @@ fileio_stat(const char *path, struct _stat64 *buf)
 	file_time_to_unix_time(&(attributes.ftLastWriteTime), &(buf->st_mtime));
 	file_time_to_unix_time(&(attributes.ftCreationTime), &(buf->st_ctime));
 
-	if (attributes.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-		WIN32_FIND_DATAW findbuf = { 0 };
-		HANDLE handle = FindFirstFileW(wpath, &findbuf);
-		if (handle != INVALID_HANDLE_VALUE) {
-			if ((findbuf.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
-				(findbuf.dwReserved0 == IO_REPARSE_TAG_SYMLINK)) {
-				buf->st_mode |= S_IFLNK;
-			}
-			FindClose(handle);
-		}
-	}	
+	/* link type supercedes other file type bits */
+	if (is_link) {
+		buf->st_mode &= ~S_IFMT;
+		buf->st_mode |= S_IFLNK;
+	}
+
 	ret = 0;
+
 cleanup:
+	if (link_handle != INVALID_HANDLE_VALUE)
+		CloseHandle(link_handle);
 	if (wpath)
-		free(wpath);	
+		free(wpath);
 	return ret;
+}
+
+int
+fileio_stat(const char *path, struct _stat64 *buf)
+{
+	return fileio_stat_or_lstat_internal(path, buf, 0);
+}
+
+int
+fileio_lstat(const char *path, struct _stat64 *buf)
+{
+	return fileio_stat_or_lstat_internal(path, buf, 1);
 }
 
 long
@@ -946,4 +988,219 @@ fileio_is_io_available(struct w32_io* pio, BOOL rd)
 	} else { /* write */
 		return (pio->write_details.pending == FALSE) ? TRUE : FALSE;
 	}
+}
+
+ssize_t
+fileio_readlink(const char *path, char *buf, size_t bufsiz)
+{
+	/* note: there are two approaches for resolving a symlink in Windows:
+	 *
+	 * 1) Use CreateFile() to obtain a file handle to the reparse point and
+	 *    send using the DeviceIoControl() call to retrieve the link data from the
+	 *    reparse point.
+	 * 2) Use CreateFile() to obtain a file handle to the target file followed
+	 *    by a call to GetFinalPathNameByHandle() to get the real path on the
+	 *    file system.
+	 *
+	 * This approach uses the first method because the second method does not
+	 * work on broken link since the target file cannot be opened.  It also
+	 * requires additional I/O to read both the symlink and its target.
+	 */
+
+	/* abbreviated REPARSE_DATA_BUFFER data structure for decoding symlinks;
+	 * the full definition can be found in ntifs.h within the Windows DDK.
+	 * we include it here so the DDK does not become prereq to the build.
+	 * for more info: https://msdn.microsoft.com/en-us/library/cc232006.aspx
+	 */
+
+	debug4("readlink - io:%p", pio);
+
+	typedef struct _REPARSE_DATA_BUFFER_SYMLINK {
+		ULONG ReparseTag;
+		USHORT ReparseDataLength;
+		USHORT Reserved;
+		USHORT SubstituteNameOffset;
+		USHORT SubstituteNameLength;
+		USHORT PrintNameOffset;
+		USHORT PrintNameLength;
+		ULONG Flags;
+		WCHAR PathBuffer[1];
+	} REPARSE_DATA_BUFFER_SYMLINK, *PREPARSE_DATA_BUFFER_SYMLINK;
+
+	/* early declarations for cleanup */
+	ssize_t ret = -1;
+	wchar_t *wpath = NULL;
+	wchar_t *linkpath = NULL;
+	char *output = NULL;
+	HANDLE handle = INVALID_HANDLE_VALUE;
+	PREPARSE_DATA_BUFFER_SYMLINK reparse_buffer = NULL;
+
+	/* sanity check */
+	if (path == NULL || buf == NULL || bufsiz == 0) {
+		errno = EINVAL;
+		goto cleanup;
+	}
+
+	if ((wpath = utf8_to_utf16(path)) == NULL) {
+		errno = ENOMEM;
+		goto cleanup;
+	}
+
+	/* obtain a handle to send to deviceioctl */
+	handle = CreateFileW(wpath, 0, 0, NULL, OPEN_EXISTING, 
+		FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, 0);
+	if (handle == INVALID_HANDLE_VALUE) {
+		errno = errno_from_Win32LastError();
+		goto cleanup;
+	}
+
+	/* send a request to the file system to get the real path */
+	reparse_buffer = (PREPARSE_DATA_BUFFER_SYMLINK) malloc(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+	DWORD dwBytesReturned = 0;
+	if (DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT, NULL, 0,
+		(LPVOID) reparse_buffer, MAXIMUM_REPARSE_DATA_BUFFER_SIZE, &dwBytesReturned, 0) == 0) {
+		errno = errno_from_Win32LastError();
+		goto cleanup;
+	}
+
+	/* ensure file is actually symlink */
+	if (reparse_buffer->ReparseTag != IO_REPARSE_TAG_SYMLINK) {
+		errno = EINVAL;
+		goto cleanup;
+	}
+
+	/* the symlink structure has a 'Print Name' value that is displayed to the
+	 * user which is different from the actual value it uses for redirection
+	 * called the 'Substitute Name'; since the Substitute Name has an odd format
+	 * that begins with \??\ and it appears that CreateSymbolicLink() always
+	 * formats the PrintName value consistently we will just use that
+	 */
+	int symlink_nonnull_size = reparse_buffer->PrintNameLength;
+	wchar_t * symlink_nonnull = &reparse_buffer->PathBuffer[reparse_buffer->PrintNameOffset / sizeof(WCHAR)];
+
+	/* allocate area to hold a null terminated version of the string */
+	if ((linkpath = malloc(symlink_nonnull_size + sizeof(wchar_t))) == NULL) {
+		goto cleanup;
+	}
+
+	/* copy the data out of the reparse buffer and add null terminator */
+	memcpy_s(linkpath, symlink_nonnull_size + sizeof(wchar_t), symlink_nonnull, symlink_nonnull_size);
+	linkpath[symlink_nonnull_size / sizeof(wchar_t)] = L'\0';
+
+	/* convert link path to utf8 */
+	if ((output = utf16_to_utf8(linkpath)) == NULL) {
+		errno = ENOMEM;
+		goto cleanup;
+	}
+
+	/* determine if we need to prepend a forward slash to make this look like
+	 * an absolute path C:\Path\Target --> /C:/Path/Target
+	 */
+	int abs_chars = is_absolute_path(output) ? 1 : 0;
+	if (abs_chars)
+		buf[0] = '/';
+
+	/* copy link data to output buffer; per specification, truncation is okay */
+	convertToForwardslash(output);
+	size_t out_size = strlen(output);
+	memcpy(buf + abs_chars, output, min(out_size, bufsiz - abs_chars));
+	ret = (ssize_t) min(out_size + abs_chars, bufsiz);
+
+cleanup:
+
+	if (linkpath)
+		free(linkpath);
+	if (reparse_buffer)
+		free(reparse_buffer);
+	if (handle != INVALID_HANDLE_VALUE)
+		CloseHandle(handle);
+	if (wpath)
+		free(wpath);
+	if (output)
+		free(output);
+
+	return (ssize_t)ret;
+}
+
+int
+fileio_symlink(const char *target, const char *linkpath)
+{
+	if (target == NULL || linkpath == NULL) {
+		errno = EFAULT;
+		return -1;
+	}
+
+	DWORD ret = 0;
+	wchar_t *target_utf16 = utf8_to_utf16(resolved_path(target));
+	wchar_t *linkpath_utf16 = utf8_to_utf16(resolved_path(linkpath));
+	wchar_t *resolved_utf16 = _wcsdup(target_utf16);
+	if (target_utf16 == NULL || linkpath_utf16 == NULL || resolved_utf16 == NULL) {
+		errno = ENOMEM;
+		ret = -1;
+		goto cleanup;
+	}
+
+	/* Relative targets are relative to the link and not our current directory
+	 * so attempt to calculate a resolvable path by removing the link file name
+	 * leaving only the parent path and then append the relative link:
+	 * C:\Path\Link with Link->SubDir\Target to C:\Path\SubDir\Target
+	 */
+	if (!is_absolute_path(target)) {
+
+		/* allocate area to hold the total possible path */
+		free(resolved_utf16);
+		size_t resolved_len = (wcslen(target_utf16) + wcslen(linkpath_utf16) + 1);
+		resolved_utf16 = malloc(resolved_len * sizeof(wchar_t));
+		if (resolved_utf16 == NULL) {
+			errno = ENOMEM;
+			ret = -1;
+			goto cleanup;
+		}
+
+		/* copy the relative target to the end of the link's parent */
+		wcscpy_s(resolved_utf16, resolved_len, linkpath_utf16);
+		convertToBackslashW(resolved_utf16);
+		wchar_t * ptr = wcsrchr(resolved_utf16, L'\\');
+		if (ptr == NULL) wcscpy_s(resolved_utf16, resolved_len, target_utf16);
+		else wcscpy_s(ptr + 1, resolved_len - (ptr + 1 - resolved_utf16), target_utf16);
+	}
+
+	/* unlike other platforms, we need to know whether the symbolic link target is
+	 * a file or a directory.  the only way we can confidently do this is to
+	 * get the attributes of the target.  therefore, our symlink() has the
+	 * limitation of only creating symlink with valid targets
+	 */
+	WIN32_FILE_ATTRIBUTE_DATA attributes = { 0 };
+	if (GetFileAttributesExW(resolved_utf16, GetFileExInfoStandard, &attributes) == FALSE) {
+		errno = errno_from_Win32LastError();
+		ret = -1;
+		goto cleanup;
+	}
+
+	/* use the attribute of the file to determine the proper flag to send */
+	DWORD create_flags = (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ?
+		SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+
+	/* symlink creation on earlier versions of windows were a privileged op
+ 	 * and then an option was added to create symlink using from an unprivileged
+ 	 * context so we try both operations, attempting privileged version first.
+	 * note: 0x2 = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+	 */
+	if (CreateSymbolicLinkW(linkpath_utf16, target_utf16, create_flags) == 0) {
+		if (CreateSymbolicLinkW(linkpath_utf16, target_utf16, create_flags | 0x2) == 0) {
+			errno = errno_from_Win32LastError();
+			ret = -1;
+			goto cleanup;
+		}
+	}
+
+cleanup:
+
+	if (target_utf16)
+		free(target_utf16);
+	if (linkpath_utf16)
+		free(linkpath_utf16);
+	if (resolved_utf16)
+		free(resolved_utf16);
+	return ret;
 }

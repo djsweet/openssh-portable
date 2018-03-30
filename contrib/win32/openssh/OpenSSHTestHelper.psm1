@@ -37,7 +37,7 @@ function Set-OpenSSHTestEnvironment
     (   
         [string] $OpenSSHBinPath,
         [string] $TestDataPath = "$env:SystemDrive\OpenSSHTests",        
-        [Boolean] $DebugMode = $false,
+        [Switch] $DebugMode,
         [Switch] $NoAppVerifier,
         [Switch] $PostmortemDebugging,
         [Switch] $NoLibreSSL
@@ -72,17 +72,20 @@ function Set-OpenSSHTestEnvironment
         "PubKeyUser"= $PubKeyUser;                             # test user to be used with explicit key for key auth
         "PasswdUser"= $PasswdUser;                             # common password for all test accounts
         "TestAccountPW"= $OpenSSHTestAccountsPassword;         # common password for all test accounts
-        "TestDataPath" = $TestDataPath;                    # openssh tests path
+        "TestDataPath" = $TestDataPath;                        # openssh tests path
         "TestSetupLogFile" = $Script:TestSetupLogFile;         # openssh test setup log file
         "E2ETestResultsFile" = $Script:E2ETestResultsFile;     # openssh E2E test results file
         "UnitTestResultsFile" = $Script:UnitTestResultsFile;   # openssh unittest test results file
         "E2ETestDirectory" = $Script:E2ETestDirectory          # the directory of E2E tests
         "UnitTestDirectory" = $Script:UnitTestDirectory        # the directory of unit tests
-        "DebugMode" = $DebugMode                               # run openssh E2E in debug mode
+        "DebugMode" = $DebugMode.IsPresent                     # run openssh E2E in debug mode
         "EnableAppVerifier" = $Script:EnableAppVerifier
         "PostmortemDebugging" = $Script:PostmortemDebugging
         "NoLibreSSL" = $Script:NoLibreSSL
         }
+
+    #start service if not already started
+    Start-Service -Name sshd
         
     #if user does not set path, pick it up
     if([string]::IsNullOrEmpty($OpenSSHBinPath))
@@ -130,6 +133,8 @@ function Set-OpenSSHTestEnvironment
     {
         $Script:WindowsInBox = $true
         $Global:OpenSSHTestInfo.Add("WindowsInBox", $true)
+        $Global:OpenSSHTestInfo["EnableAppVerifier"] = $false
+        $Script:EnableAppVerifier = $false
     }
 
     $description = @"
@@ -162,20 +167,18 @@ WARNING: Following changes will be made to OpenSSH configuration
        New-Item -ItemType Directory -Path $TestDataPath -Force -ErrorAction SilentlyContinue | out-null
     }
 
-    
-    if(-not (Test-Path $OpenSSHConfigPath -pathType Container))
-    {
-        #starting the service will create ssh config folder
-        start-service sshd
-    }    
     $backupConfigPath = Join-Path $OpenSSHConfigPath sshd_config.ori
-    #Backup existing OpenSSH configuration
-    if (-not (Test-Path $backupConfigPath -PathType Leaf)) {
-        Copy-Item (Join-Path $OpenSSHConfigPath sshd_config) $backupConfigPath -Force
-    }
     $targetsshdConfig = Join-Path $OpenSSHConfigPath sshd_config
+    #Backup existing OpenSSH configuration
+    if ((Test-Path $targetsshdConfig -PathType Leaf) -and (-not (Test-Path $backupConfigPath -PathType Leaf))) {
+        Copy-Item $targetsshdConfig $backupConfigPath -Force
+    }    
     # copy new sshd_config
     Copy-Item (Join-Path $Script:E2ETestDirectory sshd_config) $targetsshdConfig -Force
+    if($DebugMode) {
+        $con = (Get-Content $targetsshdConfig | Out-String).Replace("#SyslogFacility AUTH","SyslogFacility LOCAL0")
+        Set-Content -Path $targetsshdConfig -Value "$con" -Force    
+    }
     
     Start-Service ssh-agent
 
@@ -261,7 +264,7 @@ WARNING: Following changes will be made to OpenSSH configuration
     cmd /c "ssh-add $testPriKeypath 2>&1 >> $Script:TestSetupLogFile"
 
     #Enable AppVerifier
-    if($EnableAppVerifier)
+    if($Script:EnableAppVerifier)
     {        
         # clear all applications in application verifier first
         &  $env:windir\System32\appverif.exe -disable * -for *  | out-null

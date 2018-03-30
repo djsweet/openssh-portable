@@ -742,7 +742,13 @@ privsep_preauth(Authctxt *authctxt)
 
 #ifdef FORK_NOT_SUPPORTED
 	if (privsep_auth_child) {
-		authctxt->pw = w32_getpwuid(1);
+		struct connection_info *ci = get_connection_info(1, options.use_dns);
+
+		authctxt->pw = getpwuid(geteuid());
+		ci->user = authctxt->pw->pw_name;
+		parse_server_match_config(&options, ci);
+		log_change_level(options.log_level);
+		process_permitopen(active_state, &options);
 		authctxt->valid = 1;
 		return 1;
 	}
@@ -770,13 +776,28 @@ privsep_preauth(Authctxt *authctxt)
 		    posix_spawn_file_actions_adddup2(&actions, tmp_sock, STDOUT_FILENO) != 0 ||
 		    posix_spawn_file_actions_adddup2(&actions, pmonitor->m_recvfd, PRIVSEP_MONITOR_FD) != 0 ||
 		    posix_spawn_file_actions_adddup2(&actions, pmonitor->m_log_sendfd, PRIVSEP_LOG_FD) != 0 )
-			error("posix_spawn initialization failed");		
-		else {
+			fatal("posix_spawn initialization failed");		
+		
+		{
 			char** argv = privsep_child_cmdline(0);
 			if (__posix_spawn_asuser(&pid, argv[0], &actions, NULL, argv, NULL, SSH_PRIVSEP_USER) != 0)
-				error("%s, posix_spawn failed", __func__);
+				fatal("%s, fork of unprivileged child failed", __func__);
+			
 			posix_spawn_file_actions_destroy(&actions);
 		}
+
+		debug2("Network child is on pid %ld", (long)pid);
+
+		pmonitor->m_pid = pid;
+		if (have_agent) {
+			r = ssh_get_authentication_socket(&auth_sock);
+			if (r != 0) {
+				error("Could not get agent socket: %s",
+					ssh_err(r));
+				have_agent = 0;
+			}
+		}
+
 		close(pmonitor->m_recvfd);
 		close(pmonitor->m_log_sendfd);
 		send_config_state(pmonitor->m_sendfd, &cfg);
@@ -876,14 +897,16 @@ privsep_postauth(Authctxt *authctxt)
 		    posix_spawn_file_actions_adddup2(&actions, tmp_sock, STDIN_FILENO) != 0 ||
 		    posix_spawn_file_actions_adddup2(&actions, tmp_sock, STDOUT_FILENO) != 0 ||
 		    posix_spawn_file_actions_adddup2(&actions, pmonitor->m_recvfd, PRIVSEP_MONITOR_FD) != 0)
-			error("posix_spawn initialization failed");
-		else {
+			fatal("posix_spawn initialization failed");
+		
+		{
 			char** argv = privsep_child_cmdline(1);
 			if (__posix_spawn_asuser(&pmonitor->m_pid, argv[0], &actions, NULL, argv, NULL, authctxt->pw->pw_name) != 0)
-				error("%s, posix_spawn failed", __func__);
+				fatal("fork of unprivileged child failed");
 			posix_spawn_file_actions_destroy(&actions);
 		}
 		
+		verbose("User child is on pid %ld", (long)pmonitor->m_pid);
 		send_config_state(pmonitor->m_sendfd, &cfg);
 		send_hostkeys_state(pmonitor->m_sendfd);
 		send_idexch_state(pmonitor->m_sendfd);

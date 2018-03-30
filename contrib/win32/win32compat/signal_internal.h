@@ -1,11 +1,12 @@
 #include <Windows.h>
 
 /* child processes */
-#define MAX_CHILDREN 50
+#define MAX_CHILDREN 512
+
 struct _children {
 	/* 
 	 * array of handles and process_ids. 
-	 * intial (num_children - num_zombies) are alive 
+	 * initial (num_children - num_zombies) are alive 
 	 * rest are zombies 
 	 */
 	HANDLE handles[MAX_CHILDREN];
@@ -30,3 +31,13 @@ struct _timer_info {
 	__int64 run_time_sec; /* time in seconds, timer is set to go off from ticks_at_start */
 };
 int sw_init_timer();
+
+#define MAXIMUM_WAIT_OBJECTS_ENHANCED 1024
+#define WAIT_OBJECT_0_ENHANCED 0x00000000
+#define WAIT_ABANDONED_0_ENHANCED 0x10000000
+#define WAIT_TIMEOUT_ENHANCED 0x20000000
+#define WAIT_IO_COMPLETION_ENHANCED 0x30000000
+#define WAIT_FAILED_ENHANCED WAIT_FAILED
+
+DWORD wait_for_multiple_objects_enhanced(_In_ DWORD  nCount, _In_ const HANDLE *lpHandles,
+	_In_ DWORD dwMilliseconds, _In_ BOOL bAlertable);

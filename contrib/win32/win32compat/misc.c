@@ -56,7 +56,7 @@
 
 static char* s_programdir = NULL;
 
-/* Maximum reparse buffer info size. The max user defined reparse 
+/* Maximum reparse buffer info size. The max user defined reparse
  * data is 16KB, plus there's a header. 
  */
 #define MAX_REPARSE_SIZE 17000 
@@ -67,35 +67,11 @@ static char* s_programdir = NULL;
 #define REPARSE_MOUNTPOINT_HEADER_SIZE 8
 
  /* Difference in us between UNIX Epoch and Win32 Epoch */
-#define EPOCH_DELTA_US  116444736000000000ULL
-#define RATE_DIFF 10000000ULL /* 1000 nsecs */
+#define EPOCH_DELTA  116444736000000000ULL /* in 100 nsecs intervals */
+#define RATE_DIFF 10000000ULL /* 100 nsecs */
 
-typedef struct _REPARSE_DATA_BUFFER {
-	ULONG  ReparseTag;
-	USHORT ReparseDataLength;
-	USHORT Reserved;
-	union {
-		struct {
-			USHORT SubstituteNameOffset;
-			USHORT SubstituteNameLength;
-			USHORT PrintNameOffset;
-			USHORT PrintNameLength;
-			WCHAR PathBuffer[1];
-		} SymbolicLinkReparseBuffer;
-
-		struct {
-			USHORT SubstituteNameOffset;
-			USHORT SubstituteNameLength;
-			USHORT PrintNameOffset;
-			USHORT PrintNameLength;
-			WCHAR PathBuffer[1];
-		} MountPointReparseBuffer;
-
-		struct {
-			UCHAR  DataBuffer[1];
-		} GenericReparseBuffer;
-	};
-} REPARSE_DATA_BUFFER, *PREPARSE_DATA_BUFFER;
+#define NSEC_IN_SEC 1000000000ULL // 10**9
+#define USEC_IN_SEC 1000000ULL // 10**6
 
 /* Windows CRT defines error string messages only till 43 in errno.h
  * This is an extended list that defines messages for EADDRINUSE through EWOULDBLOCK
@@ -151,6 +127,14 @@ usleep(unsigned int useconds)
 	return 1;
 }
 
+static LONGLONG
+timespec_to_nsec(const struct timespec *req)
+{
+	LONGLONG sec = req->tv_sec;
+	return sec * NSEC_IN_SEC + req->tv_nsec;
+}
+
+
 int
 nanosleep(const struct timespec *req, struct timespec *rem)
 {
@@ -167,7 +151,8 @@ nanosleep(const struct timespec *req, struct timespec *rem)
 		return -1;
 	}
 
-	li.QuadPart = -req->tv_nsec;
+	/* convert timespec to 100ns intervals */
+	li.QuadPart = -(timespec_to_nsec(req) / 100);
 	if (!SetWaitableTimer(timer, &li, 0, NULL, NULL, FALSE)) {
 		CloseHandle(timer);
 		errno = EFAULT;
@@ -180,6 +165,7 @@ nanosleep(const struct timespec *req, struct timespec *rem)
 		CloseHandle(timer);
 		return 0;
 	default:
+		CloseHandle(timer);
 		errno = EFAULT;
 		return -1;
 	}
@@ -201,12 +187,12 @@ gettimeofday(struct timeval *tv, void *tz)
 	/* Fetch time since Jan 1, 1601 in 100ns increments */
 	GetSystemTimeAsFileTime(&timehelper.ft);	
 
-	/* Remove the epoch difference */
-	us = timehelper.ns - EPOCH_DELTA_US;
+	/* Remove the epoch difference & convert 100ns to us */
+	us = (timehelper.ns - EPOCH_DELTA) / 10;
 
 	/* Stuff result into the timeval */
-	tv->tv_sec = (long)(us / RATE_DIFF);
-	tv->tv_usec = (long)(us % RATE_DIFF);
+	tv->tv_sec = (long)(us / USEC_IN_SEC);
+	tv->tv_usec = (long)(us % USEC_IN_SEC);
 
 	return 0;
 }
@@ -404,6 +390,7 @@ w32_setvbuf(FILE *stream, char *buffer, int mode, size_t size) {
 		return setvbuf(stream, buffer, mode, size);
 }
 
+/* TODO - deprecate this. This is not a POSIX API, used internally only */
 char *
 w32_programdir()
 {
@@ -481,6 +468,9 @@ strmode(mode_t mode, char *p)
 	case S_IFREG:			/* regular */
 		*p++ = '-';
 		break;
+	case S_IFLNK:			/* symbolic link */
+		*p++ = 'l';
+		break;			
 #ifdef S_IFSOCK
 	case S_IFSOCK:			/* socket */
 		*p++ = 's';
@@ -544,7 +534,7 @@ void
 unix_time_to_file_time(ULONG t, LPFILETIME pft)
 {
 	ULONGLONG ull;
-	ull = UInt32x32To64(t, RATE_DIFF) + EPOCH_DELTA_US;
+	ull = UInt32x32To64(t, RATE_DIFF) + EPOCH_DELTA;
 
 	pft->dwLowDateTime = (DWORD)ull;
 	pft->dwHighDateTime = (DWORD)(ull >> 32);
@@ -555,7 +545,7 @@ void
 file_time_to_unix_time(const LPFILETIME pft, time_t * winTime)
 {
 	*winTime = ((long long)pft->dwHighDateTime << 32) + pft->dwLowDateTime;
-	*winTime -= EPOCH_DELTA_US;
+	*winTime -= EPOCH_DELTA;
 	*winTime /= RATE_DIFF;		 /* Nano to seconds resolution */
 }
 
@@ -667,9 +657,7 @@ w32_utimes(const char *filename, struct timeval *tvp)
 int
 w32_symlink(const char *target, const char *linkpath)
 {
-	/* Not supported in windows */
-	errno = EOPNOTSUPP;
-	return -1;
+	return fileio_symlink(target, linkpath);
 }
 
 int
@@ -685,6 +673,11 @@ w32_rename(const char *old_name, const char *new_name)
 {
 	char old_name_resolved[PATH_MAX] = {0, };
 	char new_name_resolved[PATH_MAX] = {0, };
+
+	if (old_name == NULL || new_name == NULL) {
+		errno = EFAULT;
+		return -1;
+	}
 
 	strcpy_s(old_name_resolved, _countof(old_name_resolved), resolved_path(old_name));
 	strcpy_s(new_name_resolved, _countof(new_name_resolved), resolved_path(new_name));
@@ -830,13 +823,17 @@ w32_stat(const char *input_path, struct w32_stat *buf)
 	return fileio_stat(resolved_path(input_path), (struct _stat64*)buf);
 }
 
+int
+w32_lstat(const char *input_path, struct w32_stat *buf)
+{
+	return fileio_lstat(resolved_path(input_path), (struct _stat64*)buf);
+}
+
 /* if file is symbolic link, copy its link into "link" */
 int
 readlink(const char *path, char *link, int linklen)
 {
-	if(strcpy_s(link, linklen, resolved_path(path)))
-		return -1;
-	return 0;
+	return fileio_readlink(resolved_path(path), link, linklen);
 }
 
 /* convert forward slash to back slash */
@@ -1457,7 +1454,7 @@ get_program_data_path()
 
 /* Windows absolute paths - \abc, /abc, c:\abc, c:/abc, __PROGRAMDATA__\openssh\sshd_config */
 int
-is_absolute_path(char *path)
+is_absolute_path(const char *path)
 {
 	int retVal = 0;
 	if(*path == '\"') /* skip double quote if path is "c:\abc" */
